@@ -62,7 +62,7 @@ def format_delay(delay):
 
 def format_stopovers(stopovers):
     if not stopovers:
-        return "Keine weiteren Halte"
+        return "Keine weiteren Halte verfuegbar"
     lines = []
     for stop in stopovers:
         stop_name = stop.get("stop", {}).get("name", "---")
@@ -74,7 +74,7 @@ def format_stopovers(stopovers):
             delay_min = delay // 60
             delay_str = f"(+{delay_min})"
         lines.append(f"{arrival_time}{delay_str} {stop_name}")
-    return " -> ".join(lines)
+    return "\n".join(lines)
 
 def generate_rss_feed():
     departures = fetch_departures(results=10, duration=120)
@@ -112,7 +112,7 @@ def generate_rss_feed():
                 stopovers_text = format_stopovers(stopovers)
                 item_desc.text = stopovers_text
             else:
-                item_desc.text = f"Richtung: {direction}"
+                item_desc.text = f"Linie: {line_name} | Richtung: {direction}"
     xml_str = ET.tostring(rss, encoding="unicode")
     dom = minidom.parseString(xml_str)
     return dom.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
