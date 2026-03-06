@@ -479,8 +479,21 @@ def _get_departures():
 # ---------------------------------------------------------------------------
 def _build_feed():
     deps_tuple, trips_url, source_info = _get_departures()
-    departures = list(deps_tuple)
-    now_str = datetime.now(BERLIN_TZ).strftime("%a, %d %b %Y %H:%M:%S %z")
+    now = datetime.now(BERLIN_TZ)
+    now_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
+
+    # Echtzeit-Filter: Vergangene Abfahrten beim Rendern entfernen
+    # (Cache kann bis zu 90 Sek. alte Daten enthalten)
+    departures = []
+    for dep in deps_tuple:
+        ref_dt = dep.get("actual_dt") or dep.get("planned_dt")
+        # Ausgefallene Fahrten 5 Min anzeigen, dann entfernen
+        if dep.get("cancelled"):
+            if dep.get("planned_dt") and dep["planned_dt"] < now - timedelta(minutes=5):
+                continue
+        elif ref_dt and ref_dt < now:
+            continue
+        departures.append(dep)
 
     # XML manuell erzeugen fuer volle Kontrolle ueber Encoding und CDATA
     lines = []
