@@ -13,153 +13,136 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 app = Flask(__name__)
 
+# Konfiguration
 STOP_ID = "8006336"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
-API_URL = f"https://v6.db.transport.rest/stops/{STOP_ID}/departures"
-TRIPS_URL = "https://v6.db.transport.rest/trips"
+
+# API Endpunkte
+API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID}/departures"
+API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID}/departures"
+TRIPS_URL_DB = "https://v6.db.transport.rest/trips"
+TRIPS_URL_VBN = "https://v6.vbn.transport.rest/trips"
 
 # Cache-Konfiguration (2 Minuten TTL)
 cache = TTLCache(maxsize=100, ttl=120)
 
 HEADERS = {
-    "User-Agent": "Wennigsen-RSS-Feed-Bot/1.1 (https://wennigsen-rss-feed.onrender.com)"
+    "User-Agent": "Wennigsen-RSS-Feed-Bot/1.2 (https://wennigsen-rss-feed.onrender.com)"
 }
-
-@cached(cache)
-def fetch_departures(results=15, duration=120):
-    params = {"results": results, "duration": duration, "language": "de", "pretty": "false"}
-    try:
-        # SSL-Verifizierung deaktiviert, da die API oft Zertifikatsprobleme hat
-        response = requests.get(API_URL, params=params, headers=HEADERS, timeout=10, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        deps = data.get("departures", [])
-        logging.info(f"Successfully fetched {len(deps)} departures.")
-        return deps
-    except Exception as e:
-        logging.error(f"Error fetching departures: {e}")
-        return []
-
-@cached(cache)
-def fetch_stopovers(trip_id, current_stop_id):
-    try:
-        encoded_trip_id = quote(trip_id, safe='')
-        url = f"{TRIPS_URL}/{encoded_trip_id}?stopovers=true"
-        response = requests.get(url, headers=HEADERS, timeout=10, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        stopovers = data.get("trip", {}).get("stopovers", [])
-        
-        found_current = False
-        following_stops = []
-        for stop in stopovers:
-            stop_id = stop.get("stop", {}).get("id", "")
-            if stop_id == current_stop_id or stop_id == STOP_ID:
-                found_current = True
-                continue
-            if found_current:
-                following_stops.append(stop)
-        return following_stops
-    except Exception as e:
-        logging.error(f"Error fetching stopovers for trip {trip_id}: {e}")
-        return []
 
 def parse_iso_time(iso_time):
     """Parst ISO-Zeitstempel und gibt ein timezone-aware datetime-Objekt in Europe/Berlin zurück."""
     if not iso_time:
         return None
     try:
-        # Ersetzt 'Z' durch +00:00 für die Kompatibilität mit fromisoformat
         fixed_iso = iso_time.replace("Z", "+00:00")
         dt_obj = datetime.fromisoformat(fixed_iso)
-        
-        # Wenn das Objekt timezone-naiv ist, gehe davon aus, dass es UTC ist und konvertiere
         if dt_obj.tzinfo is None:
             dt_obj = pytz.utc.localize(dt_obj)
-        
-        # Konvertiere in die lokale Zeitzone (Europe/Berlin)
         berlin_tz = pytz.timezone("Europe/Berlin")
         return dt_obj.astimezone(berlin_tz)
-    except ValueError:
-        logging.warning(f"Could not parse ISO time: {iso_time}")
+    except Exception:
         return None
 
 def format_time(dt):
-    """Formatiert ein datetime-Objekt zu HH:MM."""
-    if not dt:
-        return "---"
-    return dt.strftime("%H:%M")
+    return dt.strftime("%H:%M") if dt else "---"
 
-def format_delay(delay):
-    if delay is None or delay == 0:
-        return ""
-    minutes = delay // 60
-    if minutes > 0:
-        return f" (+{minutes})"
-    return ""
+@cached(cache)
+def fetch_departures():
+    """Versucht Abfahrten von der DB-API zu laden, bei Fehler Fallback auf VBN-API."""
+    apis = [
+        ("DB-API", API_DB, TRIPS_URL_DB),
+        ("VBN-API", API_VBN, TRIPS_URL_VBN)
+    ]
+    
+    for name, url, trip_base_url in apis:
+        try:
+            logging.info(f"Versuche Daten von {name} zu laden...")
+            response = requests.get(url, params={"results": 15, "duration": 120}, headers=HEADERS, timeout=8, verify=False)
+            if response.status_code == 200:
+                deps = response.json().get("departures", [])
+                if deps:
+                    logging.info(f"Erfolgreich {len(deps)} Abfahrten von {name} geladen.")
+                    return deps, trip_base_url
+            logging.warning(f"{name} lieferte keine Daten oder Fehler {response.status_code}")
+        except Exception as e:
+            logging.error(f"Fehler bei {name}: {e}")
+            
+    return [], None
 
-def format_stopovers(stopovers):
-    if not stopovers:
-        return "Keine weiteren Halte verfügbar"
-    lines = []
-    for stop in stopovers:
-        stop_name = stop.get("stop", {}).get("name", "---")
-        arrival_dt = parse_iso_time(stop.get("arrival"))
-        arrival_time = format_time(arrival_dt)
-        delay = stop.get("arrivalDelay", 0)
-        delay_str = ""
-        if delay and delay > 0:
-            delay_min = delay // 60
-            delay_str = f" (+{delay_min})"
-        lines.append(f"{arrival_time}{delay_str} {stop_name}")
-    return "\n".join(lines)
+@cached(cache)
+def fetch_stopovers(trip_id, trip_base_url):
+    """Lädt Zwischenhalte von der jeweils aktiven API."""
+    if not trip_id or not trip_base_url:
+        return []
+    try:
+        encoded_trip_id = quote(trip_id, safe='')
+        url = f"{trip_base_url}/{encoded_trip_id}?stopovers=true"
+        response = requests.get(url, headers=HEADERS, timeout=5, verify=False)
+        if response.status_code == 200:
+            stopovers = response.json().get("trip", {}).get("stopovers", [])
+            # Filter: Nur Halte NACH dem aktuellen Bahnhof
+            found_current = False
+            following_stops = []
+            for stop in stopovers:
+                s_id = stop.get("stop", {}).get("id", "")
+                if s_id == STOP_ID:
+                    found_current = True
+                    continue
+                if found_current:
+                    following_stops.append(stop)
+            return following_stops
+    except Exception:
+        pass
+    return []
 
 def generate_rss_feed():
-    departures = fetch_departures(results=15, duration=120)
+    departures, trip_base_url = fetch_departures()
     
-    # Sortiere Abfahrten nach Zeit (wichtig, falls die API sie unsortiert liefert)
-    # Wir nutzen 'when' oder 'plannedWhen' als Fallback
+    # Sortierung nach Zeit
     departures.sort(key=lambda x: x.get('when') or x.get('plannedWhen') or "")
 
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = f"Abfahrten {STOP_NAME}"
     ET.SubElement(channel, "link").text = "https://www.gvh.de"
-    ET.SubElement(channel, "description").text = f"Nächste Abfahrten am {STOP_NAME}"
+    ET.SubElement(channel, "description").text = f"Nächste Abfahrten am {STOP_NAME} (Multi-API Fallback)"
     ET.SubElement(channel, "language").text = "de-de"
 
     if not departures:
         item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = "Keine Abfahrten verfügbar"
+        ET.SubElement(item, "title").text = "Aktuell keine Abfahrten verfügbar (Alle APIs offline)"
     else:
         for dep in departures:
             item = ET.SubElement(channel, "item")
-            line_name = dep.get("line", {}).get("name", "---")
+            line = dep.get("line", {}).get("name", "---")
             direction = dep.get("direction", "---")
             
-            # Zeitverarbeitung
-            when_dt = parse_iso_time(dep.get("when"))
+            when_dt = parse_iso_time(dep.get("when") or dep.get("plannedWhen"))
             when_str = format_time(when_dt)
             
             delay = dep.get("delay", 0)
-            delay_str = format_delay(delay)
+            delay_str = f" (+{delay//60})" if delay and delay > 0 else ""
             platform = dep.get("platform") or dep.get("plannedPlatform") or ""
             platform_str = f" Gl.{platform}" if platform else ""
             
-            # Titel des RSS-Items
-            ET.SubElement(item, "title").text = f"{when_str}{delay_str} {line_name} -> {direction}{platform_str}"
+            ET.SubElement(item, "title").text = f"{when_str}{delay_str} {line} -> {direction}{platform_str}"
             
-            # Beschreibung (Zwischenhalte)
-            item_desc = ET.SubElement(item, "description")
-            trip_id = dep.get("tripId", "")
-            stop_id = dep.get("stop", {}).get("id", STOP_ID)
-            if trip_id:
-                stopovers = fetch_stopovers(trip_id, stop_id)
-                item_desc.text = format_stopovers(stopovers)
-            else:
-                item_desc.text = f"Linie: {line_name} | Richtung: {direction}"
+            # Beschreibung mit Zwischenhalten
+            desc_text = "Keine weiteren Halte verfügbar"
+            trip_id = dep.get("tripId")
+            if trip_id and trip_base_url:
+                stops = fetch_stopovers(trip_id, trip_base_url)
+                if stops:
+                    stop_lines = []
+                    for s in stops:
+                        s_name = s.get("stop", {}).get("name", "---")
+                        s_time = format_time(parse_iso_time(s.get("arrival") or s.get("plannedArrival")))
+                        stop_lines.append(f"{s_time} {s_name}")
+                    desc_text = "\n".join(stop_lines)
+            
+            ET.SubElement(item, "description").text = desc_text
     
-    # XML Pretty Print
     rough_string = ET.tostring(rss, 'utf-8')
     reparsed = minidom.parseString(rough_string)
     return reparsed.toprettyxml(indent="  ", encoding="utf-8").decode("utf-8")
@@ -169,7 +152,6 @@ def index():
     return "<h1>RSS-Feed Wennigsen Bahnhof</h1><p><a href='/feed.rss'>Zum RSS-Feed</a></p>"
 
 @app.route("/feed.rss")
-@app.route("/feed")
 def rss_feed():
     feed = generate_rss_feed()
     return Response(feed, mimetype="application/rss+xml")
