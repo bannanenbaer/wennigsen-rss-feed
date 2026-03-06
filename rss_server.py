@@ -14,12 +14,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 app = Flask(__name__)
 
 # Konfiguration
-STOP_ID = "8006336"
+STOP_ID_DB = "8006336"
+STOP_ID_UESTRA = "25005782"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
 
 # API Endpunkte
-API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID}/departures"
-API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID}/departures"
+API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
+API_UESTRA = f"https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST?outputFormat=rapidJSON&depSequence=30&type_dm=any&name_dm={STOP_ID_UESTRA}&useRealtime=1"
+
 TRIPS_URL_DB = "https://v6.db.transport.rest/trips"
 TRIPS_URL_VBN = "https://v6.vbn.transport.rest/trips"
 
@@ -27,7 +30,7 @@ TRIPS_URL_VBN = "https://v6.vbn.transport.rest/trips"
 cache = TTLCache(maxsize=100, ttl=120)
 
 HEADERS = {
-    "User-Agent": "Wennigsen-RSS-Feed-Bot/1.2 (https://wennigsen-rss-feed.onrender.com)"
+    "User-Agent": "Wennigsen-RSS-Feed-Bot/1.3 (https://wennigsen-rss-feed.onrender.com)"
 }
 
 def parse_iso_time(iso_time):
@@ -35,6 +38,7 @@ def parse_iso_time(iso_time):
     if not iso_time:
         return None
     try:
+        # Behandelt Formate wie 2026-03-06T09:05:00.000Z oder 2026-03-06T09:05:00+01:00
         fixed_iso = iso_time.replace("Z", "+00:00")
         dt_obj = datetime.fromisoformat(fixed_iso)
         if dt_obj.tzinfo is None:
@@ -47,14 +51,53 @@ def parse_iso_time(iso_time):
 def format_time(dt):
     return dt.strftime("%H:%M") if dt else "---"
 
+def process_uestra_data(data):
+    """Konvertiert ÜSTRA-RapidJSON Format in das Standard-Format des Feeds."""
+    departures = []
+    raw_deps = data.get("departures", [])
+    for rd in raw_deps:
+        line_name = rd.get("line", "---")
+        direction = rd.get("destination", "---")
+        # ÜSTRA liefert mehrere Events pro Linie
+        for event in rd.get("events", []):
+            planned = event.get("plannedTime")
+            actual = event.get("estimated_time") or planned
+            
+            planned_dt = parse_iso_time(planned)
+            actual_dt = parse_iso_time(actual)
+            
+            delay_sec = 0
+            if planned_dt and actual_dt:
+                delay_sec = int((actual_dt - planned_dt).total_seconds())
+            
+            departures.append({
+                "line": {"name": line_name},
+                "direction": direction,
+                "when": actual,
+                "plannedWhen": planned,
+                "delay": delay_sec,
+                "platform": "", # ÜSTRA API liefert hier oft keine Gleise im RapidJSON
+                "tripId": None # ÜSTRA Proxy unterstützt keine Trip-Details einfach
+            })
+    return departures
+
 @cached(cache)
 def fetch_departures():
-    """Versucht Abfahrten von der DB-API zu laden, bei Fehler Fallback auf VBN-API."""
-    apis = [
-        ("DB-API", API_DB, TRIPS_URL_DB),
-        ("VBN-API", API_VBN, TRIPS_URL_VBN)
-    ]
-    
+    """Versucht Abfahrten von DB, VBN oder ÜSTRA zu laden."""
+    # 1. Versuch: ÜSTRA (Oft am aktuellsten für Region Hannover)
+    try:
+        logging.info("Versuche Daten von ÜSTRA-API zu laden...")
+        resp = requests.get(API_UESTRA, headers=HEADERS, timeout=5, verify=False)
+        if resp.status_code == 200:
+            deps = process_uestra_data(resp.json())
+            if deps:
+                logging.info(f"Erfolgreich {len(deps)} Abfahrten von ÜSTRA geladen.")
+                return deps, None
+    except Exception as e:
+        logging.error(f"Fehler bei ÜSTRA: {e}")
+
+    # 2. & 3. Versuch: DB und VBN
+    apis = [("DB-API", API_DB, TRIPS_URL_DB), ("VBN-API", API_VBN, TRIPS_URL_VBN)]
     for name, url, trip_base_url in apis:
         try:
             logging.info(f"Versuche Daten von {name} zu laden...")
@@ -64,7 +107,6 @@ def fetch_departures():
                 if deps:
                     logging.info(f"Erfolgreich {len(deps)} Abfahrten von {name} geladen.")
                     return deps, trip_base_url
-            logging.warning(f"{name} lieferte keine Daten oder Fehler {response.status_code}")
         except Exception as e:
             logging.error(f"Fehler bei {name}: {e}")
             
@@ -72,7 +114,6 @@ def fetch_departures():
 
 @cached(cache)
 def fetch_stopovers(trip_id, trip_base_url):
-    """Lädt Zwischenhalte von der jeweils aktiven API."""
     if not trip_id or not trip_base_url:
         return []
     try:
@@ -81,12 +122,11 @@ def fetch_stopovers(trip_id, trip_base_url):
         response = requests.get(url, headers=HEADERS, timeout=5, verify=False)
         if response.status_code == 200:
             stopovers = response.json().get("trip", {}).get("stopovers", [])
-            # Filter: Nur Halte NACH dem aktuellen Bahnhof
             found_current = False
             following_stops = []
             for stop in stopovers:
                 s_id = stop.get("stop", {}).get("id", "")
-                if s_id == STOP_ID:
+                if s_id == STOP_ID_DB:
                     found_current = True
                     continue
                 if found_current:
@@ -98,20 +138,18 @@ def fetch_stopovers(trip_id, trip_base_url):
 
 def generate_rss_feed():
     departures, trip_base_url = fetch_departures()
-    
-    # Sortierung nach Zeit
     departures.sort(key=lambda x: x.get('when') or x.get('plannedWhen') or "")
 
     rss = ET.Element("rss", version="2.0")
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = f"Abfahrten {STOP_NAME}"
     ET.SubElement(channel, "link").text = "https://www.gvh.de"
-    ET.SubElement(channel, "description").text = f"Nächste Abfahrten am {STOP_NAME} (Multi-API Fallback)"
+    ET.SubElement(channel, "description").text = f"Nächste Abfahrten am {STOP_NAME} (Triple-API Fallback)"
     ET.SubElement(channel, "language").text = "de-de"
 
     if not departures:
         item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = "Aktuell keine Abfahrten verfügbar (Alle APIs offline)"
+        ET.SubElement(item, "title").text = "Aktuell keine Abfahrten verfügbar"
     else:
         for dep in departures:
             item = ET.SubElement(channel, "item")
@@ -128,7 +166,6 @@ def generate_rss_feed():
             
             ET.SubElement(item, "title").text = f"{when_str}{delay_str} {line} -> {direction}{platform_str}"
             
-            # Beschreibung mit Zwischenhalten
             desc_text = "Keine weiteren Halte verfügbar"
             trip_id = dep.get("tripId")
             if trip_id and trip_base_url:
