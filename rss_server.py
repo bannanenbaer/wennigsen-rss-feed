@@ -3,25 +3,35 @@ RSS-Feed für Abfahrten am Bahnhof Wennigsen (Deister).
 
 Architektur:
 - ÜSTRA-API liefert Abfahrtszeiten + Echtzeitdaten (primäre Quelle)
-- DB-API liefert Zwischenhalte für S-Bahnen (Anreicherung)
+- DB-API liefert Zwischenhalte, Ausfälle, Remarks (Anreicherung)
 - DB-API dient als vollständiger Fallback, falls ÜSTRA ausfällt
 - VBN-API dient als zweiter Fallback
 
+Titel-Format:
+  Pünktlich:    "S1 10:58 -> Haste Bahnhof Gl.2"
+  Verspätet:    "S1 11:02 +4 Min -> Haste Bahnhof Gl.2"
+  Ausfall:      "[FÄLLT AUS] S1 10:58 -> Haste Bahnhof Gl.2"
+
+Details enthalten:
+  - Störungsgrund (z.B. "Grund: Personalausfall")
+  - Zwischenhalte mit Uhrzeiten
+  - Hinweise (z.B. "Fahrradmitnahme begrenzt möglich")
+
 Zuverlässigkeitsmaßnahmen:
-- Retry-Logik mit exponentiellem Backoff für alle API-Aufrufe
-- Getrennte Caches für Abfahrten und Zwischenhalte
-- Immutable Cache-Einträge (Tuple statt List)
+- Retry-Logik mit exponentiellem Backoff
+- Getrennte Caches (Abfahrten 90s, Stopovers 5min)
+- Immutable Cache-Einträge (Tuple)
 - Vergangene Abfahrten werden herausgefiltert
 - Sortierung nach geparsten datetime-Objekten
+- Tolerantes Matching (±2 Minuten)
 - SSL-Warnungen unterdrückt
-- Spezifisches Exception-Handling
 """
 
 from flask import Flask, Response
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime
+from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 from urllib.parse import quote
@@ -29,13 +39,15 @@ from cachetools import TTLCache
 import logging
 import pytz
 import urllib3
-import time
 
 # ---------------------------------------------------------------------------
 # Konfiguration
 # ---------------------------------------------------------------------------
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 log = logging.getLogger("rss_server")
 
 app = Flask(__name__)
@@ -45,15 +57,14 @@ STOP_ID_UESTRA = "25005782"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
-# Cache (TTL 90 Sekunden)
+# Caches
 _departures_cache = TTLCache(maxsize=5, ttl=90)
 _stopovers_cache = TTLCache(maxsize=100, ttl=300)
 
 # ---------------------------------------------------------------------------
-# Robuste HTTP-Session mit Retry-Logik
+# Robuste HTTP-Session
 # ---------------------------------------------------------------------------
 def _build_session():
-    """Erzeugt eine requests-Session mit automatischem Retry bei Fehlern."""
     session = requests.Session()
     retries = Retry(
         total=2,
@@ -65,7 +76,8 @@ def _build_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Wennigsen-RSS-Feed/2.0 (https://wennigsen-rss-feed.onrender.com)"
+        "User-Agent": "Wennigsen-RSS-Feed/2.1 "
+                      "(https://wennigsen-rss-feed.onrender.com)"
     })
     session.verify = False
     return session
@@ -73,7 +85,7 @@ def _build_session():
 http = _build_session()
 
 # ---------------------------------------------------------------------------
-# ÜSTRA API
+# API-URLs
 # ---------------------------------------------------------------------------
 UESTRA_URL = "https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST"
 UESTRA_PARAMS = {
@@ -98,7 +110,6 @@ UESTRA_PARAMS = {
     "c": 1,
 }
 
-# DB / VBN API
 API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
 API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
 TRIPS_DB = "https://v6.db.transport.rest/trips"
@@ -108,7 +119,7 @@ TRIPS_VBN = "https://v6.vbn.transport.rest/trips"
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
 def parse_time(iso_time):
-    """Parst ISO-Zeitstempel -> datetime in Europe/Berlin. Gibt None bei Fehler."""
+    """ISO-Zeitstempel -> datetime in Europe/Berlin. None bei Fehler."""
     if not iso_time:
         return None
     try:
@@ -122,54 +133,70 @@ def parse_time(iso_time):
 
 
 def fmt(dt):
-    """Formatiert datetime -> 'HH:MM' oder '---'."""
+    """datetime -> 'HH:MM'."""
     return dt.strftime("%H:%M") if dt else "---"
 
 
 def _extract_platform(bon_str):
-    """Extrahiert Gleis aus dem ÜSTRA 'bon'-Feld (z.B. 'de:03241:5782:91:2' -> '2').
-    Gibt '' zurück, wenn kein sinnvolles Gleis erkennbar ist."""
+    """Gleis aus ÜSTRA 'bon'-Feld extrahieren."""
     if not bon_str:
         return ""
     parts = bon_str.split(":")
     if len(parts) >= 5:
         candidate = parts[-1]
-        # Nur kurze Nummern sind Gleise (1, 2, 3...), keine langen IDs wie 5782
         if candidate.isdigit() and len(candidate) <= 2:
             return candidate
     return ""
 
 
+def _clean_line_name(raw):
+    """'S-Bahn S2' -> 'S2', 'Bus 540' bleibt."""
+    if raw.startswith("S-Bahn "):
+        return raw[7:]
+    return raw
+
+
 # ---------------------------------------------------------------------------
-# Daten laden: ÜSTRA (primär)
+# ÜSTRA API (primäre Abfahrtszeiten)
 # ---------------------------------------------------------------------------
 def _fetch_uestra():
-    """Lädt Abfahrten von der ÜSTRA-API. Gibt eine Liste von Dicts zurück."""
+    """Lädt Abfahrten + Hinweise von der ÜSTRA-API."""
     try:
         resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=8)
         if resp.status_code != 200:
-            log.warning("ÜSTRA lieferte Status %s", resp.status_code)
+            log.warning("ÜSTRA Status %s", resp.status_code)
             return []
         data = resp.json()
     except Exception as e:
-        log.error("ÜSTRA-Anfrage fehlgeschlagen: %s", e)
+        log.error("ÜSTRA fehlgeschlagen: %s", e)
         return []
 
     now = datetime.now(BERLIN_TZ)
     results = []
+
     for rd in data.get("departures", []):
-        line_raw = rd.get("line", "---")
+        line_name = _clean_line_name(rd.get("line", "---"))
         number = rd.get("number", "")
         direction = rd.get("destination", "---")
-        bon = rd.get("bon", "")
-        platform = _extract_platform(bon)
-        infos = rd.get("infos", [])
-        hints = rd.get("hints", [])
+        platform = _extract_platform(rd.get("bon", ""))
 
-        # Linienname bereinigen: "S-Bahn S2" -> "S2", "Bus 540" bleibt
-        line_name = line_raw
-        if line_raw.startswith("S-Bahn "):
-            line_name = line_raw.replace("S-Bahn ", "")
+        # Hinweise sammeln (z.B. Fahrradmitnahme, Niederflurbus)
+        hints_text = []
+        for h in rd.get("hints", []):
+            content = h.get("content", "")
+            htype = h.get("type", "")
+            if htype != "VehicleType" and content:
+                hints_text.append(content)
+
+        # Störungsmeldungen aus infos-Feld
+        disruptions = []
+        for info in rd.get("infos", []):
+            title = info.get("title", "")
+            text = info.get("text", "")
+            if title:
+                disruptions.append(title)
+            elif text:
+                disruptions.append(text)
 
         for event in rd.get("events", []):
             planned_str = event.get("plannedTime")
@@ -180,7 +207,6 @@ def _fetch_uestra():
             planned_dt = parse_time(planned_str)
             actual_dt = parse_time(actual_str) or planned_dt
 
-            # Vergangene Abfahrten überspringen
             ref_dt = actual_dt or planned_dt
             if not ref_dt or ref_dt < now:
                 continue
@@ -197,44 +223,77 @@ def _fetch_uestra():
                 "actual_dt": actual_dt,
                 "delay": delay_sec,
                 "platform": platform,
+                "cancelled": False,
+                "remarks": disruptions[:],
+                "hints": hints_text[:],
                 "source": "uestra",
                 "trip_id": None,
             })
 
-    log.info("ÜSTRA: %d aktuelle Abfahrten geladen.", len(results))
+    log.info("ÜSTRA: %d Abfahrten geladen.", len(results))
     return results
 
 
 # ---------------------------------------------------------------------------
-# Daten laden: DB / VBN (Fallback + Zwischenhalte)
+# DB / VBN API (Fallback + Anreicherung)
 # ---------------------------------------------------------------------------
 def _fetch_db_or_vbn():
-    """Lädt Abfahrten von DB- oder VBN-API. Gibt (Liste, trips_base_url) zurück."""
+    """Lädt Abfahrten von DB/VBN inkl. Ausfälle und Remarks."""
     apis = [("DB", API_DB, TRIPS_DB), ("VBN", API_VBN, TRIPS_VBN)]
     now = datetime.now(BERLIN_TZ)
 
     for name, url, trips_url in apis:
         try:
-            resp = http.get(url, params={"results": 15, "duration": 120}, timeout=10)
+            resp = http.get(
+                url,
+                params={"results": 30, "duration": 180,
+                        "remarks": "true", "language": "de"},
+                timeout=10,
+            )
             if resp.status_code != 200:
-                log.warning("%s lieferte Status %s", name, resp.status_code)
+                log.warning("%s Status %s", name, resp.status_code)
                 continue
             raw = resp.json().get("departures", [])
             if not raw:
-                log.warning("%s lieferte keine Abfahrten.", name)
+                log.warning("%s keine Abfahrten.", name)
                 continue
 
             results = []
             for d in raw:
+                cancelled = d.get("cancelled", False)
                 when_str = d.get("when") or d.get("plannedWhen")
-                dt = parse_time(when_str)
-                if not dt or dt < now:
+                planned_when = d.get("plannedWhen")
+
+                planned_dt = parse_time(planned_when)
+                actual_dt = parse_time(when_str) if when_str else planned_dt
+
+                # Bei Ausfällen: when ist oft None, nutze plannedWhen
+                if not actual_dt:
+                    actual_dt = planned_dt
+                if not planned_dt:
                     continue
 
-                planned_dt = parse_time(d.get("plannedWhen")) or dt
+                # Vergangene nur überspringen wenn nicht ausgefallen
+                ref = actual_dt or planned_dt
+                if not cancelled and ref < now:
+                    continue
+                # Ausgefallene in der Vergangenheit auch überspringen
+                if cancelled and planned_dt < now:
+                    continue
+
                 delay = d.get("delay") or 0
-                if not isinstance(delay, int):
+                if not isinstance(delay, (int, float)):
                     delay = 0
+
+                # Remarks auswerten -> Störungsgründe extrahieren
+                remarks_list = []
+                for rm in d.get("remarks", []):
+                    rm_type = rm.get("type", "")
+                    rm_code = rm.get("code", "")
+                    rm_text = rm.get("text", "") or rm.get("summary", "")
+                    # Nur relevante Meldungen (warning/status), keine Hinweise
+                    if rm_type in ("warning", "status") and rm_text:
+                        remarks_list.append(rm_text)
 
                 line_obj = d.get("line", {})
                 results.append({
@@ -242,25 +301,29 @@ def _fetch_db_or_vbn():
                     "number": line_obj.get("productName", ""),
                     "direction": d.get("direction", "---"),
                     "planned_dt": planned_dt,
-                    "actual_dt": dt,
-                    "delay": max(0, delay),
-                    "platform": d.get("platform") or d.get("plannedPlatform") or "",
+                    "actual_dt": actual_dt,
+                    "delay": max(0, int(delay)),
+                    "platform": d.get("platform")
+                                or d.get("plannedPlatform") or "",
+                    "cancelled": cancelled,
+                    "remarks": remarks_list,
+                    "hints": [],
                     "source": name.lower(),
                     "trip_id": d.get("tripId"),
                 })
 
             if results:
-                log.info("%s: %d aktuelle Abfahrten geladen.", name, len(results))
+                log.info("%s: %d Abfahrten geladen.", name, len(results))
                 return results, trips_url
 
         except Exception as e:
-            log.error("%s-Anfrage fehlgeschlagen: %s", name, e)
+            log.error("%s fehlgeschlagen: %s", name, e)
 
     return [], None
 
 
 # ---------------------------------------------------------------------------
-# Zwischenhalte laden (nur für DB/VBN-Trips)
+# Zwischenhalte laden
 # ---------------------------------------------------------------------------
 def _fetch_stopovers(trip_id, trips_url):
     """Lädt Zwischenhalte für eine Fahrt. Nutzt Cache."""
@@ -274,30 +337,50 @@ def _fetch_stopovers(trip_id, trips_url):
 
     try:
         encoded = quote(trip_id, safe="")
-        resp = http.get(f"{trips_url}/{encoded}?stopovers=true", timeout=6)
+        resp = http.get(
+            f"{trips_url}/{encoded}",
+            params={"stopovers": "true", "remarks": "true", "language": "de"},
+            timeout=6,
+        )
         if resp.status_code != 200:
+            log.warning("Stopovers Status %s für Trip %s", resp.status_code, trip_id[:40])
             return ()
-        raw = resp.json().get("trip", {}).get("stopovers", [])
+
+        trip_data = resp.json().get("trip", {})
+        raw = trip_data.get("stopovers", [])
+
+        # Störungsgründe aus Trip-Remarks extrahieren
+        trip_remarks = []
+        for rm in trip_data.get("remarks", []):
+            rm_type = rm.get("type", "")
+            rm_text = rm.get("text", "") or rm.get("summary", "")
+            if rm_type in ("warning", "status") and rm_text:
+                trip_remarks.append(rm_text)
 
         found = False
         stops = []
         for s in raw:
             sid = s.get("stop", {}).get("id", "")
-            station_id = s.get("stop", {}).get("station", {}).get("id", "")
+            station_id = (s.get("stop", {})
+                           .get("station", {})
+                           .get("id", ""))
             if sid == STOP_ID_DB or station_id == STOP_ID_DB:
                 found = True
                 continue
             if found:
-                name = s.get("stop", {}).get("name", "---")
-                arr = parse_time(s.get("arrival") or s.get("plannedArrival"))
-                stops.append((fmt(arr), name))
+                sname = s.get("stop", {}).get("name", "---")
+                arr = parse_time(
+                    s.get("arrival") or s.get("plannedArrival")
+                )
+                s_cancelled = s.get("cancelled", False)
+                stops.append((fmt(arr), sname, s_cancelled))
 
-        result = tuple(stops)
+        result = (tuple(stops), tuple(trip_remarks))
         _stopovers_cache[cache_key] = result
         return result
 
     except Exception as e:
-        log.error("Stopovers-Fehler für %s: %s", trip_id[:30], e)
+        log.error("Stopovers-Fehler: %s", e)
         return ()
 
 
@@ -305,54 +388,92 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenführen
 # ---------------------------------------------------------------------------
 def _get_departures():
-    """Liefert sortierte Abfahrten. Nutzt Cache."""
+    """Liefert sortierte Abfahrten (aus Cache oder frisch)."""
     cached = _departures_cache.get("deps")
     if cached is not None:
         return cached
 
-    # 1. ÜSTRA als primäre Quelle für Abfahrtszeiten
     uestra_deps = _fetch_uestra()
-
-    # 2. DB/VBN für Zwischenhalte (und als Fallback)
     db_deps, trips_url = _fetch_db_or_vbn()
 
     if uestra_deps:
-        # ÜSTRA hat Daten -> nutze sie, reichere S-Bahnen mit DB-Zwischenhalten an
-        # Erstelle Lookup: (Linie, gerundete Minute) -> DB-Departure für Matching
+        # Tolerantes Matching: (Linie, Minute ±2) -> DB-Departure
         db_lookup = {}
         for d in db_deps:
-            key = (d["line"], d["planned_dt"].strftime("%H:%M") if d["planned_dt"] else "")
-            db_lookup[key] = d
+            if d["planned_dt"]:
+                key = (d["line"], d["planned_dt"].strftime("%H:%M"))
+                db_lookup[key] = d
 
         enriched = []
         for dep in uestra_deps:
-            # Versuche passende DB-Abfahrt zu finden für Zwischenhalte
-            key = (dep["line"], dep["planned_dt"].strftime("%H:%M") if dep["planned_dt"] else "")
+            if not dep["planned_dt"]:
+                enriched.append(dep)
+                continue
+
+            # Exaktes Matching
+            key = (dep["line"], dep["planned_dt"].strftime("%H:%M"))
             db_match = db_lookup.get(key)
+
+            # Tolerantes Matching (±2 Minuten)
+            if not db_match:
+                for offset in [-60, 60, -120, 120]:
+                    alt_time = dep["planned_dt"] + timedelta(seconds=offset)
+                    alt_key = (dep["line"], alt_time.strftime("%H:%M"))
+                    db_match = db_lookup.get(alt_key)
+                    if db_match:
+                        break
+
             if db_match:
                 dep["trip_id"] = db_match.get("trip_id")
-                # Übernehme Gleis von DB falls ÜSTRA keins hat
+                # Gleis von DB übernehmen falls ÜSTRA keins hat
                 if not dep["platform"] and db_match.get("platform"):
                     dep["platform"] = db_match["platform"]
+                # Ausfall-Status von DB übernehmen
+                if db_match.get("cancelled"):
+                    dep["cancelled"] = True
+                # Remarks von DB übernehmen
+                if db_match.get("remarks"):
+                    dep["remarks"] = list(
+                        set(dep["remarks"] + db_match["remarks"])
+                    )
+
             enriched.append(dep)
+
+        # Ausgefallene DB-Abfahrten hinzufügen, die ÜSTRA nicht kennt
+        uestra_keys = set()
+        for dep in enriched:
+            if dep["planned_dt"]:
+                uestra_keys.add(
+                    (dep["line"], dep["planned_dt"].strftime("%H:%M"))
+                )
+        for d in db_deps:
+            if d.get("cancelled") and d["planned_dt"]:
+                key = (d["line"], d["planned_dt"].strftime("%H:%M"))
+                if key not in uestra_keys:
+                    enriched.append(d)
 
         final = enriched
         source_info = "ÜSTRA + DB"
     elif db_deps:
-        # Fallback: Nur DB/VBN-Daten
         final = db_deps
         source_info = "DB/VBN (Fallback)"
     else:
         final = []
         source_info = "Keine Daten"
 
-    # Sortierung nach tatsächlicher Abfahrtszeit
-    final.sort(key=lambda x: x.get("actual_dt") or x.get("planned_dt") or datetime.max.replace(tzinfo=pytz.utc))
+    # Sortierung: Ausfälle ans Ende ihrer Zeitgruppe, sonst nach actual_dt
+    _max_dt = datetime.max.replace(tzinfo=pytz.utc)
+    final_sorted = sorted(
+        final,
+        key=lambda x: (
+            x.get("actual_dt") or x.get("planned_dt") or _max_dt,
+            1 if x.get("cancelled") else 0,
+        ),
+    )
 
-    # Als Tuple cachen (immutable)
-    result = (tuple(final), trips_url, source_info)
+    result = (tuple(final_sorted), trips_url, source_info)
     _departures_cache["deps"] = result
-    log.info("Feed erstellt mit Quelle: %s (%d Abfahrten)", source_info, len(final))
+    log.info("Feed: %s (%d Abfahrten)", source_info, len(final_sorted))
     return result
 
 
@@ -360,7 +481,6 @@ def _get_departures():
 # RSS-Feed generieren
 # ---------------------------------------------------------------------------
 def _build_feed():
-    """Erzeugt den RSS-Feed als XML-String."""
     deps_tuple, trips_url, source_info = _get_departures()
     departures = list(deps_tuple)
 
@@ -378,7 +498,9 @@ def _build_feed():
 
     if not departures:
         item = ET.SubElement(channel, "item")
-        ET.SubElement(item, "title").text = "Aktuell keine Abfahrten verfügbar"
+        ET.SubElement(item, "title").text = (
+            "Aktuell keine Abfahrten verfügbar"
+        )
         ET.SubElement(item, "description").text = (
             "Alle Datenquellen liefern derzeit keine Abfahrten. "
             "Bitte prüfe die GVH-Verkehrsmeldungen."
@@ -387,29 +509,105 @@ def _build_feed():
         for dep in departures:
             item = ET.SubElement(channel, "item")
 
-            when_str = fmt(dep.get("actual_dt") or dep.get("planned_dt"))
-            delay = dep.get("delay", 0)
-            delay_str = f" (+{delay // 60} Min)" if delay >= 60 else ""
             line = dep.get("line", "---")
             direction = dep.get("direction", "---")
             platform = dep.get("platform", "")
             platform_str = f" Gl.{platform}" if platform else ""
+            cancelled = dep.get("cancelled", False)
+            delay = dep.get("delay", 0)
+            planned_dt = dep.get("planned_dt")
+            actual_dt = dep.get("actual_dt")
 
-            ET.SubElement(item, "title").text = (
-                f"{when_str}{delay_str} {line} -> {direction}{platform_str}"
-            )
+            # --- TITEL ---
+            if cancelled:
+                # Format: [FÄLLT AUS] S1 10:58 -> Haste Gl.2
+                title = (
+                    f"[FÄLLT AUS] {line} {fmt(planned_dt)} "
+                    f"-> {direction}{platform_str}"
+                )
+            elif delay >= 60:
+                # Format: S1 11:02 +4 Min -> Haste Gl.2
+                delay_min = delay // 60
+                title = (
+                    f"{line} {fmt(actual_dt)} +{delay_min} Min "
+                    f"-> {direction}{platform_str}"
+                )
+            else:
+                # Format: S1 10:58 -> Haste Gl.2
+                title = (
+                    f"{line} {fmt(actual_dt or planned_dt)} "
+                    f"-> {direction}{platform_str}"
+                )
+
+            ET.SubElement(item, "title").text = title
+
+            # --- BESCHREIBUNG / DETAILS ---
+            desc_parts = []
+
+            # 1. Störungsgründe (aus DB-Remarks)
+            remarks = dep.get("remarks", [])
+
+            # 2. Zwischenhalte + Trip-Remarks laden
+            trip_id = dep.get("trip_id")
+            trip_remarks = []
+            stopover_lines = []
+            if trip_id and trips_url and not cancelled:
+                so_result = _fetch_stopovers(trip_id, trips_url)
+                if so_result and len(so_result) == 2:
+                    stops, t_remarks = so_result
+                    trip_remarks = list(t_remarks)
+                    for s_time, s_name, s_cancelled in stops:
+                        if s_cancelled:
+                            stopover_lines.append(
+                                f"{s_time} {s_name} [entfällt]"
+                            )
+                        else:
+                            stopover_lines.append(f"{s_time} {s_name}")
+
+            # Alle Remarks zusammenführen (dedupliziert)
+            all_remarks = list(dict.fromkeys(remarks + trip_remarks))
+
+            # Verspätungsinfo
+            if cancelled:
+                desc_parts.append("*** Diese Fahrt fällt aus ***")
+                if planned_dt:
+                    desc_parts.append(
+                        f"Geplante Abfahrt: {fmt(planned_dt)}"
+                    )
+            elif delay >= 60:
+                delay_min = delay // 60
+                desc_parts.append(
+                    f"Verspätung: +{delay_min} Min "
+                    f"(geplant: {fmt(planned_dt)}, "
+                    f"voraussichtlich: {fmt(actual_dt)})"
+                )
+
+            # Störungsgründe
+            if all_remarks:
+                for rm in all_remarks:
+                    desc_parts.append(f"Grund: {rm}")
 
             # Zwischenhalte
-            desc_parts = []
-            trip_id = dep.get("trip_id")
-            if trip_id and trips_url:
-                stops = _fetch_stopovers(trip_id, trips_url)
-                if stops:
-                    for s_time, s_name in stops:
-                        desc_parts.append(f"{s_time} {s_name}")
+            if stopover_lines:
+                if desc_parts:
+                    desc_parts.append("")  # Leerzeile
+                desc_parts.append("Zwischenhalte:")
+                desc_parts.extend(stopover_lines)
+            elif not cancelled:
+                if desc_parts:
+                    desc_parts.append("")
+                desc_parts.append("Keine Zwischenhalte verfügbar")
+
+            # Hinweise (ÜSTRA)
+            hints = dep.get("hints", [])
+            if hints:
+                if desc_parts:
+                    desc_parts.append("")
+                for h in hints:
+                    desc_parts.append(f"Hinweis: {h}")
 
             if not desc_parts:
-                desc_parts.append("Keine weiteren Halte verfügbar")
+                desc_parts.append("Keine weiteren Informationen")
 
             ET.SubElement(item, "description").text = "\n".join(desc_parts)
 
@@ -426,7 +624,8 @@ def index():
     return (
         "<h1>RSS-Feed Wennigsen (Deister) Bahnhof</h1>"
         "<p><a href='/feed.rss'>Zum RSS-Feed</a></p>"
-        "<p>Datenquellen: ÜSTRA (Echtzeit) + Deutsche Bahn (Zwischenhalte)</p>"
+        "<p>Datenquellen: ÜSTRA (Echtzeit) + Deutsche Bahn "
+        "(Zwischenhalte &amp; Störungen)</p>"
     )
 
 
@@ -439,10 +638,18 @@ def rss_feed():
 
 @app.route("/health")
 def health():
-    """Einfacher Health-Check für Monitoring."""
+    """Health-Check für Monitoring."""
     try:
         deps_tuple, _, source = _get_departures()
-        return {"status": "ok", "source": source, "departures": len(deps_tuple)}
+        cancelled = sum(1 for d in deps_tuple if d.get("cancelled"))
+        delayed = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
+        return {
+            "status": "ok",
+            "source": source,
+            "departures": len(deps_tuple),
+            "cancelled": cancelled,
+            "delayed": delayed,
+        }
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
 
