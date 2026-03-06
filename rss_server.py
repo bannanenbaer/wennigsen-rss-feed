@@ -21,7 +21,6 @@ from urllib3.util.retry import Retry
 from datetime import datetime, timedelta
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
-from cachetools import TTLCache
 import logging
 import pytz
 import urllib3
@@ -44,9 +43,7 @@ STOP_ID_UESTRA = "25005782"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
-# Caches
-_departures_cache = TTLCache(maxsize=5, ttl=90)
-_stopovers_cache = TTLCache(maxsize=100, ttl=300)
+
 
 # ---------------------------------------------------------------------------
 # Umlaute ersetzen (Fritz!Fon-kompatibel)
@@ -331,12 +328,7 @@ def _fetch_db_or_vbn():
 # Zwischenhalte laden
 # ---------------------------------------------------------------------------
 def _fetch_stopovers(trip_id, trips_url):
-    """Laedt Zwischenhalte fuer eine Fahrt. Nutzt Cache."""
-    cache_key = (trip_id, trips_url)
-    cached = _stopovers_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
+    """Laedt Zwischenhalte fuer eine Fahrt."""
     if not trip_id or not trips_url:
         return ()
 
@@ -381,7 +373,6 @@ def _fetch_stopovers(trip_id, trips_url):
                 stops.append((fmt(arr), sname, s_cancelled))
 
         result = (tuple(stops), tuple(trip_remarks))
-        _stopovers_cache[cache_key] = result
         return result
 
     except Exception as e:
@@ -393,10 +384,7 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenfuehren
 # ---------------------------------------------------------------------------
 def _get_departures():
-    """Liefert sortierte Abfahrten (aus Cache oder frisch)."""
-    cached = _departures_cache.get("deps")
-    if cached is not None:
-        return cached
+    """Liefert sortierte Abfahrten."""
 
     uestra_deps = _fetch_uestra()
     db_deps, trips_url = _fetch_db_or_vbn()
@@ -469,7 +457,6 @@ def _get_departures():
     )
 
     result = (tuple(final_sorted), trips_url, source_info)
-    _departures_cache["deps"] = result
     log.info("Feed: %s (%d Abfahrten)", source_info, len(final_sorted))
     return result
 
