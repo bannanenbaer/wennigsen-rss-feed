@@ -494,6 +494,7 @@ def _build_feed():
         '</description>'
     )
     lines.append('<language>de-de</language>')
+    lines.append('<ttl>1</ttl>')
     lines.append(f'<lastBuildDate>{now_str}</lastBuildDate>')
 
     if not departures:
@@ -514,6 +515,20 @@ def _build_feed():
             delay = dep.get("delay", 0)
             planned_dt = dep.get("planned_dt")
             actual_dt = dep.get("actual_dt")
+
+            # --- Richtungspfeil bestimmen (nur Zuege, keine Busse) ---
+            # > = Richtung Hannover, < = von Hannover weg
+            arrow = ""
+            if line.upper().startswith("S") and line[1:].isdigit():
+                dir_lower = direction.lower()
+                hannover_keywords = ["hannover", "hbf", "hauptbahnhof",
+                                     "bismarck", "nordstadt", "leinhausen",
+                                     "letter", "seelze", "wunstorf",
+                                     "minden", "nienburg"]
+                if any(kw in dir_lower for kw in hannover_keywords):
+                    arrow = "&gt;"
+                else:
+                    arrow = "&lt;"
 
             # --- TITEL (kurz fuer Fritz!Fon-Display) ---
             if cancelled:
@@ -538,6 +553,9 @@ def _build_feed():
             title = title.replace("&", "&amp;")
             title = title.replace("<", "&lt;")
             title = title.replace(">", "&gt;")
+            # Pfeil VOR den Titel setzen (bereits XML-escaped)
+            if arrow:
+                title = f"{arrow} {title}"
 
             # --- BESCHREIBUNG (in CDATA fuer Fritz!Fon) ---
             desc_parts = []
@@ -641,7 +659,12 @@ def rss_feed():
     return Response(
         xml_bytes,
         mimetype="application/rss+xml",
-        headers={"Content-Type": "application/rss+xml; charset=iso-8859-1"}
+        headers={
+            "Content-Type": "application/rss+xml; charset=iso-8859-1",
+            "Cache-Control": "no-cache, no-store, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
     )
 
 
