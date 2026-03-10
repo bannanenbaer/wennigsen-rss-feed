@@ -516,10 +516,16 @@ def _build_feed():
             planned_dt = dep.get("planned_dt")
             actual_dt = dep.get("actual_dt")
 
-            # --- Richtungspfeil bestimmen (nur Zuege, keine Busse) ---
-            # > = Richtung Hannover, < = von Hannover weg
+            # --- Ziel-Station kuerzen ---
+            direction_short = direction.replace("Hauptbahnhof", "Hbf.")
+            direction_short = direction_short.replace("Bahnhof", "Bhf.")
+            # Nienburg (Weser) bleibt wie es ist
+            direction_short = _sanitize(direction_short)
+
+            # --- Richtungspfeil bestimmen (nur Zuege) ---
+            is_train = line.upper().startswith("S") and any(c.isdigit() for c in line)
             arrow = ""
-            if line.upper().startswith("S") and line[1:].isdigit():
+            if is_train:
                 dir_lower = direction.lower()
                 hannover_keywords = ["hannover", "hbf", "hauptbahnhof",
                                      "bismarck", "nordstadt", "leinhausen",
@@ -530,32 +536,28 @@ def _build_feed():
                 else:
                     arrow = "&lt;"
 
-            # --- TITEL (kurz fuer Fritz!Fon-Display) ---
+            # --- Zeit-Formatierung ---
+            time_str = fmt(actual_dt or planned_dt)
+            delay_str = ""
             if cancelled:
-                title = (
-                    f"[AUSFALL] {line} {fmt(planned_dt)} "
-                    f"{_sanitize(direction)}{platform_str}"
-                )
+                time_str = f"[AUSFALL] {fmt(planned_dt)}"
             elif delay >= 60:
                 delay_min = delay // 60
-                title = (
-                    f"{line} {fmt(actual_dt)} +{delay_min}min "
-                    f"{_sanitize(direction)}{platform_str}"
-                )
+                delay_str = f" (+{delay_min})"
+
+            # --- TITEL (Fritz!Fon optimiert) ---
+            if is_train:
+                # Format: 16:00 (+2) | S1 (Gl.1) > Hannover Hbf.
+                platform_part = f" ({platform_str.strip()})" if platform_str.strip() else ""
+                title = f"{time_str}{delay_str} | {line}{platform_part} {arrow} {direction_short}"
             else:
-                title = (
-                    f"{line} {fmt(actual_dt or planned_dt)} "
-                    f"{_sanitize(direction)}{platform_str}"
-                )
+                # Format: 15:40 | 520 - Weetzen/Bhf.
+                title = f"{time_str}{delay_str} | {line} - {direction_short}"
 
             # XML-Sonderzeichen escapen im Titel
-            title = _sanitize(title)
             title = title.replace("&", "&amp;")
             title = title.replace("<", "&lt;")
             title = title.replace(">", "&gt;")
-            # Pfeil VOR den Titel setzen (bereits XML-escaped)
-            if arrow:
-                title = f"{arrow} {title}"
 
             # --- BESCHREIBUNG (in CDATA fuer Fritz!Fon) ---
             desc_parts = []
@@ -599,8 +601,137 @@ def _build_feed():
 
             all_remarks = list(dict.fromkeys(remarks + trip_remarks))
             if all_remarks:
+                # --- Stoerungsgruende filtern und Feiertags-Easter-Eggs ---
+                m, d = now_berlin.month, now_berlin.day
+                
+                # Feiertage definieren
+                is_april_fools = (m == 4 and d == 1)
+                is_halloween = (m == 10 and d == 31)
+                is_christmas = (m == 12 and d in [24, 25, 26])
+                is_new_year = (m == 12 and d == 31) or (m == 1 and d == 1)
+                
+                # Ostern (vereinfacht fuer Maerz/April)
+                is_easter = (m == 3 and d >= 28) or (m == 4 and d <= 5)
+
                 for rm in all_remarks:
-                    desc_parts.append(f"Grund: {_sanitize(rm)}")
+                    rm_clean = _sanitize(rm)
+                    rm_lower = rm_clean.lower()
+                    
+                    # Unwichtige Meldungen (Aufzuege, etc.) ausfiltern
+                    ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
+                    if any(kw in rm_lower for kw in ignore_keywords):
+                        continue
+                    
+                    special_msg = None
+                    if is_april_fools:
+                        fools_map = {
+                            "personalmangel": "Lokfuehrer hat verschlafen (Kissen war zu weich)",
+                            "signalstoerung": "Signal zeigt nur noch Pink (Modetrend)",
+                            "personen im gleis": "Entenfamilie uebt fuer den Ententanz",
+                            "notarzteinsatz": "Einhorn-Sichtung auf den Gleisen",
+                            "weichendefekt": "Weiche hat sich fuer den Urlaub entschieden",
+                            "oberleitungsstoerung": "Vogel hat die Leitung als Schaukel benutzt",
+                            "technische stoerung": "Der Zug hat heute einfach keine Lust",
+                            "verspaetung aus vorheriger fahrt": "Zug musste noch kurz bei Oma vorbei",
+                            "polizeieinsatz": "Polizei sucht nach dem verlorenen Witz",
+                            "witterungsbedingt": "Schneeflocken haben eine Sitzblockade gemacht",
+                            "bauarbeiten": "Gleise werden heute frisch gebuegelt",
+                            "unwetter": "Wolken haben heute schlechte Laune",
+                            "streik": "Zuege machen heute Yoga-Pause",
+                            "defekt": "Der Zug braucht erst mal einen Kaffee"
+                        }
+                        for k, v in fools_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Der Zug macht gerade ein Nickerchen"
+                    
+                    elif is_halloween:
+                        halloween_map = {
+                            "personalmangel": "Lokfuehrer wurde von Geistern entfuehrt",
+                            "signalstoerung": "Signale leuchten heute wie Kuerbisse",
+                            "personen im gleis": "Zombies auf den Schienen gesichtet",
+                            "notarzteinsatz": "Vampir-Attacke im Speisewagen",
+                            "weichendefekt": "Die Weiche ist verhext",
+                            "oberleitungsstoerung": "Hexenbesen in der Leitung verfangen",
+                            "technische stoerung": "Spuk im Maschinenraum",
+                            "verspaetung aus vorheriger fahrt": "Zug ist im Nebel des Grauens verschollen",
+                            "polizeieinsatz": "Geisterjaeger im Einsatz",
+                            "witterungsbedingt": "Gruseliger Nebel verlangsamt die Fahrt",
+                            "bauarbeiten": "Grabungsarbeiten fuer die Unterwelt",
+                            "unwetter": "Ein schreckliches Gewitter zieht auf",
+                            "streik": "Skelette machen heute Pause",
+                            "defekt": "Der Zug ist heute verflucht"
+                        }
+                        for k, v in halloween_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Suesses oder Saures! Der Zug ist heute gruselig langsam"
+
+                    elif is_christmas:
+                        xmas_map = {
+                            "personalmangel": "Lokfuehrer hilft dem Weihnachtsmann beim Packen",
+                            "signalstoerung": "Signale leuchten heute wie Weihnachtssterne",
+                            "personen im gleis": "Rentier-Herde auf den Gleisen",
+                            "notarzteinsatz": "Plaetzchen-Ueberdosis im Bordbistro",
+                            "weichendefekt": "Die Weiche ist eingefroren wie am Nordpol",
+                            "oberleitungsstoerung": "Lichterkette in der Leitung verfangen",
+                            "technische stoerung": "Wichtel in der Elektronik",
+                            "verspaetung aus vorheriger fahrt": "Zug musste noch Geschenke ausliefern",
+                            "polizeieinsatz": "Polizei sucht nach dem Grinch",
+                            "witterungsbedingt": "Schneegestoeber wie im Wintermaerchen",
+                            "bauarbeiten": "Wichtelwerkstatt auf den Gleisen",
+                            "unwetter": "Rentierschlitten hat Vorfahrt",
+                            "streik": "Zuege machen heute Bescherung",
+                            "defekt": "Der Zug braucht eine Portion Gluehwein"
+                        }
+                        for k, v in xmas_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Frohe Weihnachten! Der Zug geniesst die Feiertage"
+
+                    elif is_new_year:
+                        ny_map = {
+                            "personalmangel": "Lokfuehrer sucht noch nach seinen Vorsaetzen",
+                            "signalstoerung": "Signale funkeln wie Feuerwerk",
+                            "personen im gleis": "Gluecksschweinchen auf den Gleisen",
+                            "notarzteinsatz": "Zu viel Kinderpunsch getrunken",
+                            "weichendefekt": "Die Weiche rutscht ins neue Jahr",
+                            "oberleitungsstoerung": "Konfetti in der Leitung",
+                            "technische stoerung": "System-Update fuer das neue Jahr",
+                            "verspaetung aus vorheriger fahrt": "Zug hat zu lange gefeiert",
+                            "polizeieinsatz": "Polizei wuenscht ein frohes neues Jahr",
+                            "witterungsbedingt": "Feuerwerksnebel behindert die Sicht",
+                            "bauarbeiten": "Gleise werden fuer das neue Jahr poliert",
+                            "unwetter": "Gluecksregen zieht auf",
+                            "streik": "Zuege machen Neujahrspause",
+                            "defekt": "Der Zug hat einen Kater"
+                        }
+                        for k, v in ny_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Guten Rutsch! Der Zug gleitet ins neue Jahr"
+
+                    elif is_easter:
+                        easter_map = {
+                            "personalmangel": "Lokfuehrer sucht noch Ostereier",
+                            "signalstoerung": "Signale sind heute bunt bemalt",
+                            "personen im gleis": "Osterhase auf den Gleisen gesichtet",
+                            "notarzteinsatz": "Zu viele Schokoeier gegessen",
+                            "weichendefekt": "Die Weiche ist im Osternest versteckt",
+                            "oberleitungsstoerung": "Ostereier in der Leitung verfangen",
+                            "technische stoerung": "Osterkueken in der Elektronik",
+                            "verspaetung aus vorheriger fahrt": "Zug musste noch Eier verstecken",
+                            "polizeieinsatz": "Polizei sucht nach dem goldenen Ei",
+                            "witterungsbedingt": "Aprilwetter macht was es will",
+                            "bauarbeiten": "Osterhasen-Werkstatt auf den Gleisen",
+                            "unwetter": "Eierregen zieht auf",
+                            "streik": "Zuege machen heute Eiersuche",
+                            "defekt": "Der Zug braucht eine Portion Karotten"
+                        }
+                        for k, v in easter_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
+
+                    if special_msg:
+                        desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
+                    else:
+                        desc_parts.append(f"Grund: {rm_clean}")
 
             # Zwischenhalte
             if stopover_lines:
