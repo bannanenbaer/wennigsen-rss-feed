@@ -603,15 +603,41 @@ def _build_feed():
             if all_remarks:
                 # --- Stoerungsgruende filtern und Feiertags-Easter-Eggs ---
                 m, d = now_berlin.month, now_berlin.day
+                year = now_berlin.year
+                today = now_berlin.date()
+                
+                # Gaussscher Osteralgorithmus
+                a = year % 19
+                b = year // 100
+                c = year % 100
+                dd = b // 4
+                e = b % 4
+                f = (b + 8) // 25
+                g = (b - f + 1) // 3
+                h = (19 * a + b - dd - g + 15) % 30
+                i = c // 4
+                k = c % 4
+                l = (32 + 2 * e + 2 * i - h - k) % 7
+                mm = (a + 11 * h + 22 * l) // 451
+                month_e = (h + l - 7 * mm + 114) // 31
+                day_e = ((h + l - 7 * mm + 114) % 31) + 1
+                
+                from datetime import date as _date, timedelta as _td
+                easter_sunday = _date(year, month_e, day_e)
+                karfreitag = easter_sunday - _td(days=2)
+                ostermontag = easter_sunday + _td(days=1)
+                himmelfahrt = easter_sunday + _td(days=39)  # Vatertag
                 
                 # Feiertage definieren
                 is_april_fools = (m == 4 and d == 1)
                 is_halloween = (m == 10 and d == 31)
                 is_christmas = (m == 12 and d in [24, 25, 26])
                 is_new_year = (m == 12 and d == 31) or (m == 1 and d == 1)
+                is_star_wars = (m == 5 and d == 4)  # May the 4th
+                is_vatertag = (today == himmelfahrt)
                 
-                # Ostern (vereinfacht fuer Maerz/April)
-                is_easter = (m == 3 and d >= 28) or (m == 4 and d <= 5)
+                # Ostern: Karfreitag bis Ostermontag
+                is_easter = (karfreitag <= today <= ostermontag)
 
                 for rm in all_remarks:
                     rm_clean = _sanitize(rm)
@@ -727,6 +753,48 @@ def _build_feed():
                         for k, v in easter_map.items():
                             if k in rm_lower: special_msg = v; break
                         if not special_msg: special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
+
+                    elif is_star_wars:
+                        sw_map = {
+                            "personalmangel": "Der Lokfuehrer ist auf die dunkle Seite gewechselt",
+                            "signalstoerung": "Stoerung im Hyperraum-Antrieb",
+                            "personen im gleis": "Ewoks auf den Gleisen gesichtet",
+                            "notarzteinsatz": "Jedi-Ritter braucht eine Meditationspause",
+                            "weichendefekt": "Die Macht ist nicht stark in dieser Weiche",
+                            "oberleitungsstoerung": "Imperiale Stoersender in der Leitung",
+                            "technische stoerung": "R2-D2 hat einen Kurzschluss",
+                            "verspaetung aus vorheriger fahrt": "Zug musste den Kessel-Run in unter 12 Parsec schaffen",
+                            "polizeieinsatz": "Sturmtruppler suchen nach diesen Droiden",
+                            "witterungsbedingt": "Sandsturm auf Tatooine behindert die Sicht",
+                            "bauarbeiten": "Todesstern-Konstruktion auf den Gleisen",
+                            "unwetter": "Ionensturm im Anmarsch",
+                            "streik": "Die Rebellen-Allianz macht heute Pause",
+                            "defekt": "Der Millennium Falke... ich meine der Zug ist kaputt"
+                        }
+                        for k, v in sw_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "May the 4th be with you! Moege die Puenktlichkeit mit uns sein"
+
+                    elif is_vatertag:
+                        vater_map = {
+                            "personalmangel": "Lokfuehrer ist mit dem Bollerwagen unterwegs",
+                            "signalstoerung": "Signal ist im Biergarten hängengeblieben",
+                            "personen im gleis": "Vatertags-Tour blockiert die Schienen",
+                            "notarzteinsatz": "Zu viel Hopfenkaltschale genossen",
+                            "weichendefekt": "Die Weiche macht heute eine Herrentour",
+                            "oberleitungsstoerung": "Grillwurst in der Leitung verfangen",
+                            "technische stoerung": "Zapfanlage im Bordbistro klemmt",
+                            "verspaetung aus vorheriger fahrt": "Zug musste noch kurz am Stammtisch halten",
+                            "polizeieinsatz": "Polizei sucht nach dem verlorenen Grillmeister",
+                            "witterungsbedingt": "Perfektes Grillwetter verzoegert die Abfahrt",
+                            "bauarbeiten": "Gleise werden heute als Kegelbahn genutzt",
+                            "unwetter": "Bierregen zieht auf",
+                            "streik": "Zuege machen heute Maennerabend",
+                            "defekt": "Der Zug braucht erst mal ein kuehles Blondes"
+                        }
+                        for k, v in vater_map.items():
+                            if k in rm_lower: special_msg = v; break
+                        if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
                         desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
