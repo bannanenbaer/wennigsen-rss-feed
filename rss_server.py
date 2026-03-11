@@ -348,9 +348,10 @@ def _fetch_stopovers(trip_id, trips_url):
         found = False
         stops = []
         for s in raw:
-            sid        = s.get("stop", {}).get("id", "")
-            station_id = s.get("stop", {}).get("station", {}).get("id", "")
-            if sid == STOP_ID_DB or station_id == STOP_ID_DB:
+            sid        = str(s.get("stop", {}).get("id", ""))
+            station_id = str(s.get("stop", {}).get("station", {}).get("id", ""))
+            # Wennigsen IDs: 8006336, 638806, 25005782
+            if sid in (STOP_ID_DB, "638806", "25005782") or station_id in (STOP_ID_DB, "638806", "25005782"):
                 found = True
                 continue
             if found:
@@ -567,6 +568,7 @@ def _build_feed():
             next_stop_name = ""
 
             if trip_id and trips_url:
+                log.info("Lade Stopovers fuer %s (trip_id: %s...)", line, trip_id[:20])
                 so_result = _fetch_stopovers(trip_id, trips_url)
                 if so_result and len(so_result) == 3:
                     stops, t_remarks, is_stale = so_result
@@ -874,6 +876,8 @@ def _build_feed():
             safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             lines.append(f'<title>{safe_title}</title>')
             lines.append(f'<description><![CDATA[{desc_text}]]></description>')
+            if trip_id:
+                lines.append(f'<!-- trip_id: {trip_id} -->')
             lines.append('</item>')
 
     lines.append('</channel>')
