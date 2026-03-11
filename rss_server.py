@@ -520,7 +520,8 @@ def _build_feed():
         if dep.get("cancelled"):
             if dep.get("planned_dt") and dep["planned_dt"] < now - timedelta(minutes=5):
                 continue
-        elif ref_dt and ref_dt < now - timedelta(minutes=1):
+        elif ref_dt and ref_dt < now - timedelta(minutes=5):
+            # Entferne Abfahrten, die mehr als 5 Minuten in der Vergangenheit liegen
             continue
         departures.append(dep)
 
