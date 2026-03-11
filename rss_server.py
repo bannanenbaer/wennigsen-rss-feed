@@ -535,6 +535,59 @@ def _build_feed():
     lines.append('<ttl>1</ttl>')
     lines.append(f'<lastBuildDate>{now_str}</lastBuildDate>')
 
+    # --- GROSSSTOERUNGEN erkennen ---
+    # Schluesselwoerter fuer Grossstoerungen (Streik, Unwetter etc.)
+    _DISRUPTION_KEYWORDS = [
+        "streik", "warnstreik", "arbeitskampf",
+        "unwetter", "sturm", "hochwasser", "orkan",
+        "oberleitungsschaden", "oberleitungsstoerung", "oberleitung",
+        "stellwerkstoerung", "stellwerksstoerung", "signalstoerung",
+        "sperrung", "gesperrt", "streckensperrung",
+        "schienenersatzverkehr", "sev",
+        "notarzteinsatz", "polizeieinsatz",
+        "personen im gleis", "personenunfall",
+        "bombenentschaerfung", "bombenfund",
+        "gleisstoerung", "weichenstoerung",
+        "zugausfall", "totalausfall",
+        "eingeschraenkt", "massiv",
+    ]
+
+    # Stoerungen aus allen Abfahrten sammeln
+    disruption_map = {}  # text -> {lines: set, count: int}
+    for dep in departures:
+        dep_line = dep.get("line", "---")
+        for rm in dep.get("remarks", []):
+            rm_lower = _sanitize(rm).lower()
+            is_disruption = any(kw in rm_lower for kw in _DISRUPTION_KEYWORDS)
+            if is_disruption:
+                rm_clean = _sanitize(rm)
+                if rm_clean not in disruption_map:
+                    disruption_map[rm_clean] = {"lines": set(), "count": 0}
+                disruption_map[rm_clean]["lines"].add(dep_line)
+                disruption_map[rm_clean]["count"] += 1
+
+    # Grossstoerungen als ERSTEN Eintrag anzeigen
+    if disruption_map:
+        lines.append('<item>')
+        # Titel: Anzahl Stoerungen
+        n = len(disruption_map)
+        if n == 1:
+            lines.append('<title>*** STOERUNG ***</title>')
+        else:
+            lines.append(f'<title>*** {n} STOERUNGEN ***</title>')
+
+        # Details
+        d_parts = []
+        for rm_text, info in disruption_map.items():
+            affected = ", ".join(sorted(info["lines"]))
+            d_parts.append(f"{rm_text}")
+            d_parts.append(f"Betrifft: {affected}")
+            d_parts.append("")
+
+        d_text = "\n".join(d_parts)
+        lines.append(f'<description><![CDATA[{d_text}]]></description>')
+        lines.append('</item>')
+
     if not departures:
         lines.append('<item>')
         lines.append('<title>Keine Abfahrten verfuegbar</title>')
@@ -627,7 +680,7 @@ def _build_feed():
 
             if is_train:
                 # Pfeile direkt einsetzen (ohne CDATA, da Fritz!Fon das im Titel oft nicht mag)
-                arrow_char = "→" if arrow == _ARROW_RIGHT else ("←" if arrow == _ARROW_LEFT else "-")
+                arrow_char = ">" if arrow == _ARROW_RIGHT else ("<" if arrow == _ARROW_LEFT else "-")
                 title = f"{time_str}{delay_str} | {line}{platform_part} {arrow_char} {direction_short}"
             else:
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
