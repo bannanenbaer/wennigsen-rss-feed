@@ -3,12 +3,10 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta, date
-import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import logging
 import pytz
 import urllib3
-import re
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -27,10 +25,12 @@ STOP_ID_UESTRA = "25005782"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
-# Maximalanzahl an Abfahrten im Feed (zur Begrenzung von Stopover-Requests)
 MAX_DEPARTURES = 20
-MAX_STOPS = 10  # max. Zwischenhalte in der Beschreibung
+MAX_STOPS = 10
 
+# Platzhalter fuer Pfeile (werden NACH XML-Escaping ersetzt)
+_ARROW_RIGHT = "__ARROW_RIGHT__"
+_ARROW_LEFT  = "__ARROW_LEFT__"
 
 # ---------------------------------------------------------------------------
 # Umlaute ersetzen (Fritz!Fon-kompatibel)
@@ -46,12 +46,10 @@ _UMLAUT_MAP = {
 
 
 def _sanitize(text):
-    """Ersetzt Umlaute und Sonderzeichen fuer Fritz!Fon-Kompatibilitaet."""
     if not text:
         return ""
     for char, replacement in _UMLAUT_MAP.items():
         text = text.replace(char, replacement)
-    # Alle verbleibenden Non-ASCII-Zeichen entfernen
     text = text.encode("ascii", "replace").decode("ascii")
     return text
 
@@ -74,8 +72,6 @@ def _build_session():
         "User-Agent": "Wennigsen-RSS-Feed/2.2 "
                       "(https://wennigsen-rss-feed.onrender.com)"
     })
-    # Wenn moeglich: verify = True lassen. Nur abschalten, wenn wirklich noetig.
-    # session.verify = False
     return session
 
 
@@ -107,9 +103,9 @@ UESTRA_PARAMS = {
     "c": 1,
 }
 
-API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
-API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
-TRIPS_DB = "https://v6.db.transport.rest/trips"
+API_DB   = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+API_VBN  = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
+TRIPS_DB  = "https://v6.db.transport.rest/trips"
 TRIPS_VBN = "https://v6.vbn.transport.rest/trips"
 
 
@@ -117,7 +113,6 @@ TRIPS_VBN = "https://v6.vbn.transport.rest/trips"
 # Hilfsfunktionen
 # ---------------------------------------------------------------------------
 def parse_time(iso_time):
-    """ISO-Zeitstempel -> datetime in Europe/Berlin. None bei Fehler."""
     if not iso_time:
         return None
     try:
@@ -131,12 +126,10 @@ def parse_time(iso_time):
 
 
 def fmt(dt):
-    """datetime -> 'HH:MM'."""
     return dt.strftime("%H:%M") if dt else "---"
 
 
 def _extract_platform(bon_str):
-    """Gleis aus UESTRA 'bon'-Feld extrahieren."""
     if not bon_str:
         return ""
     parts = bon_str.split(":")
@@ -148,17 +141,15 @@ def _extract_platform(bon_str):
 
 
 def _clean_line_name(raw):
-    """'S-Bahn S2' -> 'S2', 'Bus 540' bleibt."""
     if raw.startswith("S-Bahn "):
         return raw[7:]
     return raw
 
 
 # ---------------------------------------------------------------------------
-# UESTRA API (primaere Abfahrtszeiten)
+# UESTRA API
 # ---------------------------------------------------------------------------
 def _fetch_uestra():
-    """Laedt Abfahrten + Hinweise von der UESTRA-API."""
     try:
         resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=8)
         if resp.status_code != 200:
@@ -173,24 +164,22 @@ def _fetch_uestra():
     results = []
 
     for rd in data.get("departures", []):
-        line_name = _clean_line_name(rd.get("line", "---"))
-        number = rd.get("number", "")
-        direction = rd.get("destination", "---")
-        platform = _extract_platform(rd.get("bon", ""))
+        line_name  = _clean_line_name(rd.get("line", "---"))
+        number     = rd.get("number", "")
+        direction  = rd.get("destination", "---")
+        platform   = _extract_platform(rd.get("bon", ""))
 
-        # Hinweise sammeln
         hints_text = []
         for h in rd.get("hints", []):
             content = h.get("content", "")
-            htype = h.get("type", "")
+            htype   = h.get("type", "")
             if htype != "VehicleType" and content:
                 hints_text.append(content)
 
-        # Stoerungsmeldungen aus infos-Feld
         disruptions = []
         for info in rd.get("infos", []):
             title = info.get("title", "")
-            text = info.get("text", "")
+            text  = info.get("text", "")
             if title:
                 disruptions.append(title)
             elif text:
@@ -198,12 +187,12 @@ def _fetch_uestra():
 
         for event in rd.get("events", []):
             planned_str = event.get("plannedTime")
-            actual_str = event.get("estimated_time") or planned_str
+            actual_str  = event.get("estimated_time") or planned_str
             if not planned_str:
                 continue
 
             planned_dt = parse_time(planned_str)
-            actual_dt = parse_time(actual_str) or planned_dt
+            actual_dt  = parse_time(actual_str) or planned_dt
 
             ref_dt = actual_dt or planned_dt
             if not ref_dt or ref_dt < now:
@@ -214,18 +203,18 @@ def _fetch_uestra():
                 delay_sec = max(0, int((actual_dt - planned_dt).total_seconds()))
 
             results.append({
-                "line": line_name,
-                "number": number,
-                "direction": direction,
+                "line":       line_name,
+                "number":     number,
+                "direction":  direction,
                 "planned_dt": planned_dt,
-                "actual_dt": actual_dt,
-                "delay": delay_sec,
-                "platform": platform,
-                "cancelled": False,
-                "remarks": disruptions[:],
-                "hints": hints_text[:],
-                "source": "uestra",
-                "trip_id": None,
+                "actual_dt":  actual_dt,
+                "delay":      delay_sec,
+                "platform":   platform,
+                "cancelled":  False,
+                "remarks":    disruptions[:],
+                "hints":      hints_text[:],
+                "source":     "uestra",
+                "trip_id":    None,
             })
 
     log.info("UESTRA: %d Abfahrten geladen.", len(results))
@@ -233,12 +222,11 @@ def _fetch_uestra():
 
 
 # ---------------------------------------------------------------------------
-# DB / VBN API (Fallback + Anreicherung)
+# DB / VBN API
 # ---------------------------------------------------------------------------
 def _fetch_db_or_vbn():
-    """Laedt Abfahrten von DB/VBN inkl. Ausfaelle und Remarks."""
     apis = [("DB", API_DB, TRIPS_DB), ("VBN", API_VBN, TRIPS_VBN)]
-    now = datetime.now(BERLIN_TZ)
+    now  = datetime.now(BERLIN_TZ)
 
     for name, url, trips_url in apis:
         try:
@@ -258,12 +246,12 @@ def _fetch_db_or_vbn():
 
             results = []
             for d in raw:
-                cancelled = d.get("cancelled", False)
-                when_str = d.get("when") or d.get("plannedWhen")
+                cancelled   = d.get("cancelled", False)
+                when_str    = d.get("when") or d.get("plannedWhen")
                 planned_when = d.get("plannedWhen")
 
                 planned_dt = parse_time(planned_when)
-                actual_dt = parse_time(when_str) if when_str else planned_dt
+                actual_dt  = parse_time(when_str) if when_str else planned_dt
 
                 if not actual_dt:
                     actual_dt = planned_dt
@@ -289,19 +277,18 @@ def _fetch_db_or_vbn():
 
                 line_obj = d.get("line", {})
                 results.append({
-                    "line": line_obj.get("name", "---"),
-                    "number": line_obj.get("productName", ""),
-                    "direction": d.get("direction", "---"),
+                    "line":       line_obj.get("name", "---"),
+                    "number":     line_obj.get("productName", ""),
+                    "direction":  d.get("direction", "---"),
                     "planned_dt": planned_dt,
-                    "actual_dt": actual_dt,
-                    "delay": max(0, int(delay)),
-                    "platform": d.get("platform")
-                                or d.get("plannedPlatform") or "",
-                    "cancelled": cancelled,
-                    "remarks": remarks_list,
-                    "hints": [],
-                    "source": name.lower(),
-                    "trip_id": d.get("tripId"),
+                    "actual_dt":  actual_dt,
+                    "delay":      max(0, int(delay)),
+                    "platform":   d.get("platform") or d.get("plannedPlatform") or "",
+                    "cancelled":  cancelled,
+                    "remarks":    remarks_list,
+                    "hints":      [],
+                    "source":     name.lower(),
+                    "trip_id":    d.get("tripId"),
                 })
 
             if results:
@@ -318,7 +305,6 @@ def _fetch_db_or_vbn():
 # Zwischenhalte laden
 # ---------------------------------------------------------------------------
 def _fetch_stopovers(trip_id, trips_url):
-    """Laedt Zwischenhalte fuer eine Fahrt."""
     if not trip_id or not trips_url:
         return ()
 
@@ -347,23 +333,26 @@ def _fetch_stopovers(trip_id, trips_url):
         found = False
         stops = []
         for s in raw:
-            sid = s.get("stop", {}).get("id", "")
-            station_id = (s.get("stop", {})
-                           .get("station", {})
-                           .get("id", ""))
+            sid        = s.get("stop", {}).get("id", "")
+            station_id = s.get("stop", {}).get("station", {}).get("id", "")
             if sid == STOP_ID_DB or station_id == STOP_ID_DB:
                 found = True
                 continue
             if found:
-                sname = s.get("stop", {}).get("name", "---")
-                arr = parse_time(
-                    s.get("arrival") or s.get("plannedArrival")
-                )
+                sname       = s.get("stop", {}).get("name", "---")
+                arr_actual  = parse_time(s.get("arrival") or s.get("plannedArrival"))
+                arr_planned = parse_time(s.get("plannedArrival"))
                 s_cancelled = s.get("cancelled", False)
-                stops.append((fmt(arr), sname, s_cancelled))
 
-        result = (tuple(stops), tuple(trip_remarks))
-        return result
+                # Verspätung in Minuten berechnen
+                s_delay = 0
+                if arr_actual and arr_planned:
+                    s_delay = max(0, int((arr_actual - arr_planned).total_seconds()) // 60)
+
+                # (zeit, name, cancelled, delay_min)
+                stops.append((fmt(arr_actual), sname, s_cancelled, s_delay))
+
+        return (tuple(stops), tuple(trip_remarks))
 
     except Exception as e:
         log.error("Stopovers-Fehler: %s", e)
@@ -374,16 +363,13 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenfuehren
 # ---------------------------------------------------------------------------
 def _get_departures():
-    """Liefert sortierte Abfahrten."""
-
-    uestra_deps = _fetch_uestra()
+    uestra_deps        = _fetch_uestra()
     db_deps, trips_url = _fetch_db_or_vbn()
 
     if uestra_deps:
         db_lookup = {}
         for d in db_deps:
             if d["planned_dt"]:
-                # etwas robusteres Matching: Linie + Richtung + Zeit (HH:MM)
                 key = (d["line"], d["direction"], d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
 
@@ -397,10 +383,9 @@ def _get_departures():
             db_match = db_lookup.get(base_key)
 
             if not db_match:
-                # Fallback +/- bis 2 Minuten in 1-Min-Schritten
                 for offset_min in [-2, -1, 1, 2]:
                     alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
-                    alt_key = (dep["line"], dep["direction"], alt_time.strftime("%H:%M"))
+                    alt_key  = (dep["line"], dep["direction"], alt_time.strftime("%H:%M"))
                     db_match = db_lookup.get(alt_key)
                     if db_match:
                         break
@@ -412,9 +397,7 @@ def _get_departures():
                 if db_match.get("cancelled"):
                     dep["cancelled"] = True
                 if db_match.get("remarks"):
-                    dep["remarks"] = list(
-                        set(dep["remarks"] + db_match["remarks"])
-                    )
+                    dep["remarks"] = list(set(dep["remarks"] + db_match["remarks"]))
 
             enriched.append(dep)
 
@@ -430,13 +413,13 @@ def _get_departures():
                 if key not in uestra_keys:
                     enriched.append(d)
 
-        final = enriched
+        final       = enriched
         source_info = "UESTRA + DB"
     elif db_deps:
-        final = db_deps
+        final       = db_deps
         source_info = "DB/VBN (Fallback)"
     else:
-        final = []
+        final       = []
         source_info = "Keine Daten"
 
     _max_dt = datetime.max.replace(tzinfo=pytz.utc)
@@ -446,14 +429,10 @@ def _get_departures():
             x.get("actual_dt") or x.get("planned_dt") or _max_dt,
             1 if x.get("cancelled") else 0,
         ),
-    )
+    )[:MAX_DEPARTURES]
 
-    # Anzahl begrenzen (Performance/Stopovers)
-    final_sorted = final_sorted[:MAX_DEPARTURES]
-
-    result = (tuple(final_sorted), trips_url, source_info)
     log.info("Feed: %s (%d Abfahrten)", source_info, len(final_sorted))
-    return result
+    return (tuple(final_sorted), trips_url, source_info)
 
 
 # ---------------------------------------------------------------------------
@@ -461,34 +440,26 @@ def _get_departures():
 # ---------------------------------------------------------------------------
 def _build_feed():
     deps_tuple, trips_url, source_info = _get_departures()
-    now = datetime.now(BERLIN_TZ)
+    now     = datetime.now(BERLIN_TZ)
     now_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
 
-    # Echtzeit-Filter: Vergangene Abfahrten beim Rendern entfernen
-    # (Cache kann bis zu 90 Sek. alte Daten enthalten)
     departures = []
     for dep in deps_tuple:
         ref_dt = dep.get("actual_dt") or dep.get("planned_dt")
-        # Ausgefallene Fahrten 5 Min anzeigen, dann entfernen
         if dep.get("cancelled"):
             if dep.get("planned_dt") and dep["planned_dt"] < now - timedelta(minutes=5):
                 continue
         elif ref_dt and ref_dt < now - timedelta(minutes=1):
-            # kleine Pufferzeit, damit "gerade abgefahrene" Zuege noch kurz sichtbar bleiben
             continue
         departures.append(dep)
 
-    # XML manuell erzeugen fuer volle Kontrolle ueber Encoding und CDATA
     lines = []
     lines.append('<?xml version="1.0" encoding="ISO-8859-1"?>')
     lines.append('<rss version="2.0">')
     lines.append('<channel>')
     lines.append('<title>Abfahrten Wennigsen</title>')
     lines.append('<link>https://www.gvh.de</link>')
-    lines.append(
-        '<description>Naechste Abfahrten am Wennigsen (Deister) Bahnhof'
-        '</description>'
-    )
+    lines.append('<description>Naechste Abfahrten am Wennigsen (Deister) Bahnhof</description>')
     lines.append('<language>de-de</language>')
     lines.append('<ttl>1</ttl>')
     lines.append(f'<lastBuildDate>{now_str}</lastBuildDate>')
@@ -496,44 +467,45 @@ def _build_feed():
     if not departures:
         lines.append('<item>')
         lines.append('<title>Keine Abfahrten verfuegbar</title>')
-        lines.append(
-            '<description><![CDATA[Alle Datenquellen liefern '
-            'derzeit keine Abfahrten.]]></description>'
-        )
+        lines.append('<description><![CDATA[Alle Datenquellen liefern derzeit keine Abfahrten.]]></description>')
         lines.append('</item>')
     else:
         for dep in departures:
-            line = dep.get("line", "---")
-            direction = _sanitize(dep.get("direction", "---"))
-            platform = dep.get("platform", "")
-            platform_str = f" Gl.{platform}" if platform else ""
-            cancelled = dep.get("cancelled", False)
-            delay = dep.get("delay", 0)
+            line       = dep.get("line", "---")
+            direction  = _sanitize(dep.get("direction", "---"))
+            platform   = dep.get("platform", "")
+            cancelled  = dep.get("cancelled", False)
+            delay      = dep.get("delay", 0)
             planned_dt = dep.get("planned_dt")
-            actual_dt = dep.get("actual_dt")
+            actual_dt  = dep.get("actual_dt")
 
-            # --- Ziel-Station kuerzen ---
+            # Ziel kuerzen
             direction_short = direction.replace("Hauptbahnhof", "Hbf.")
             direction_short = direction_short.replace("Bahnhof", "Bhf.")
-            # Nienburg (Weser) bleibt wie es ist
             direction_short = _sanitize(direction_short)
 
-            # --- Richtungspfeil bestimmen (nur Zuege) ---
+            # --- Richtungspfeil (Platzhalter, werden NACH Escaping eingesetzt) ---
             is_train = line.upper().startswith("S") and any(c.isdigit() for c in line)
             arrow = ""
             if is_train:
                 dir_lower = direction.lower()
-                hannover_keywords = ["hannover", "hbf", "hauptbahnhof",
-                                     "bismarck", "nordstadt", "leinhausen",
-                                     "letter", "seelze", "wunstorf",
-                                     "minden", "nienburg"]
-                if any(kw in dir_lower for kw in hannover_keywords):
-                    arrow = "&gt;"
+                hannover_stations = [
+                    "hannover", "hbf", "hauptbahnhof", "seelze", "letter",
+                    "leinhausen", "nordstadt", "bismarck", "wunstorf",
+                    "barsinghausen", "garbsen", "langenhagen", "melle",
+                ]
+                haste_stations = [
+                    "haste", "egestorf", "rodenberg", "nienburg", "minden",
+                ]
+                if any(st in dir_lower for st in hannover_stations):
+                    arrow = _ARROW_RIGHT   # Platzhalter fuer >
+                elif any(st in dir_lower for st in haste_stations):
+                    arrow = _ARROW_LEFT    # Platzhalter fuer <
                 else:
-                    arrow = "&lt;"
+                    arrow = "-"
 
-            # --- Zeit-Formatierung ---
-            time_str = fmt(actual_dt or planned_dt)
+            # Zeitformatierung
+            time_str  = fmt(actual_dt or planned_dt)
             delay_str = ""
             if cancelled:
                 time_str = f"[AUSFALL] {fmt(planned_dt)}"
@@ -541,120 +513,114 @@ def _build_feed():
                 delay_min = delay // 60
                 delay_str = f" (+{delay_min})"
 
-            # --- TITEL (Fritz!Fon optimiert) ---
+            # Titel zusammenbauen
+            platform_str  = f"Gl.{platform}" if platform else ""
+            platform_part = f" ({platform_str})" if platform_str else ""
+
             if is_train:
-                # Format: 16:00 (+2) | S1 (Gl.1) > Hannover Hbf.
-                platform_part = f" ({platform_str.strip()})" if platform_str.strip() else ""
                 title = f"{time_str}{delay_str} | {line}{platform_part} {arrow} {direction_short}"
             else:
-                # Format: 15:40 | 520 - Weetzen/Bhf.
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
 
-            # XML-Sonderzeichen escapen im Titel
+            # XML-Sonderzeichen escapen (Platzhalter bleiben unveraendert)
             title = title.replace("&", "&amp;")
             title = title.replace("<", "&lt;")
             title = title.replace(">", "&gt;")
 
-            # --- BESCHREIBUNG (in CDATA fuer Fritz!Fon) ---
+            # Jetzt Platzhalter durch echte Pfeile ersetzen
+            title = title.replace(_ARROW_RIGHT, ">")
+            title = title.replace(_ARROW_LEFT,  "<")
+
+            # --- Beschreibung ---
             desc_parts = []
 
-            # Verspaetungsinfo
             if cancelled:
                 desc_parts.append("*** Fahrt faellt aus ***")
                 if planned_dt:
-                    desc_parts.append(
-                        f"Geplant: {fmt(planned_dt)}"
-                    )
+                    desc_parts.append(f"Geplant: {fmt(planned_dt)}")
             elif delay >= 60:
                 delay_min = delay // 60
                 desc_parts.append(
-                    f"+{delay_min} Min "
-                    f"(plan: {fmt(planned_dt)}, "
-                    f"neu: {fmt(actual_dt)})"
+                    f"+{delay_min} Min (plan: {fmt(planned_dt)}, neu: {fmt(actual_dt)})"
                 )
 
-            # Stoerungsgruende
-            remarks = dep.get("remarks", [])
-            trip_id = dep.get("trip_id")
-            trip_remarks = []
+            remarks    = dep.get("remarks", [])
+            trip_id    = dep.get("trip_id")
+            trip_remarks   = []
             stopover_lines = []
 
-            if trip_id and trips_url and not cancelled:
+            if trip_id and trips_url:
                 so_result = _fetch_stopovers(trip_id, trips_url)
                 if so_result and len(so_result) == 2:
                     stops, t_remarks = so_result
                     trip_remarks = list(t_remarks)
-                    for s_time, s_name, s_cancelled in stops[:MAX_STOPS]:
+                    for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
+                        delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
                         if s_cancelled:
                             stopover_lines.append(
-                                f"{s_time} {s_name_clean} [entfaellt]"
+                                f"{s_time}{delay_part} | {s_name_clean} [entfaellt]"
                             )
                         else:
                             stopover_lines.append(
-                                f"{s_time} {s_name_clean}"
+                                f"{s_time}{delay_part} | {s_name_clean}"
                             )
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
-            all_remarks_raw = remarks + trip_remarks
-            # Duplikate grob entfernen
+            # Duplikate in Remarks entfernen
             seen = set()
             all_remarks = []
-            for rm in all_remarks_raw:
+            for rm in remarks + trip_remarks:
                 key = rm.strip()
                 if key not in seen:
                     seen.add(key)
                     all_remarks.append(rm)
 
             if all_remarks:
-                # --- Stoerungsgruende filtern und Feiertags-Easter-Eggs ---
-                m, d = now.month, now.day
-                year = now.year
-                today = now.date()
+                m, d   = now.month, now.day
+                year   = now.year
+                today  = now.date()
 
                 # Gaussscher Osteralgorithmus
-                a = year % 19
-                b = year // 100
-                c = year % 100
+                a  = year % 19
+                b  = year // 100
+                c  = year % 100
                 dd = b // 4
-                e = b % 4
-                f = (b + 8) // 25
-                g = (b - f + 1) // 3
-                h = (19 * a + b - dd - g + 15) % 30
-                i = c // 4
-                k = c % 4
-                l = (32 + 2 * e + 2 * i - h - k) % 7
+                e  = b % 4
+                f  = (b + 8) // 25
+                g  = (b - f + 1) // 3
+                h  = (19 * a + b - dd - g + 15) % 30
+                i  = c // 4
+                k  = c % 4
+                l  = (32 + 2 * e + 2 * i - h - k) % 7
                 mm = (a + 11 * h + 22 * l) // 451
                 month_e = (h + l - 7 * mm + 114) // 31
-                day_e = ((h + l - 7 * mm + 114) % 31) + 1
+                day_e   = ((h + l - 7 * mm + 114) % 31) + 1
 
                 easter_sunday = date(year, month_e, day_e)
-                karfreitag = easter_sunday - timedelta(days=2)
-                ostermontag = easter_sunday + timedelta(days=1)
-                himmelfahrt = easter_sunday + timedelta(days=39)  # Vatertag
+                karfreitag    = easter_sunday - timedelta(days=2)
+                ostermontag   = easter_sunday + timedelta(days=1)
+                himmelfahrt   = easter_sunday + timedelta(days=39)
 
-                # Feiertage definieren
                 is_april_fools = (m == 4 and d == 1)
-                is_halloween = (m == 10 and d == 31)
-                is_christmas = (m == 12 and d in [24, 25, 26])
-                is_new_year = (m == 12 and d == 31) or (m == 1 and d == 1)
-                is_star_wars = (m == 5 and d == 4)  # May the 4th
-                is_vatertag = (today == himmelfahrt)
-
-                # Ostern: Karfreitag bis Ostermontag
-                is_easter = (karfreitag <= today <= ostermontag)
+                is_halloween   = (m == 10 and d == 31)
+                is_christmas   = (m == 12 and d in [24, 25, 26])
+                is_new_year    = (m == 12 and d == 31) or (m == 1 and d == 1)
+                is_star_wars   = (m == 5 and d == 4)
+                is_vatertag    = (today == himmelfahrt)
+                is_easter      = (karfreitag <= today <= ostermontag)
 
                 for rm in all_remarks:
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
 
-                    # Unwichtige Meldungen (Aufzuege, etc.) ausfiltern
                     ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
                     if any(kw in rm_lower for kw in ignore_keywords):
                         continue
 
                     special_msg = None
+
                     if is_april_fools:
                         fools_map = {
                             "personalmangel": "Lokfuehrer hat verschlafen (Kissen war zu weich)",
@@ -670,14 +636,11 @@ def _build_feed():
                             "bauarbeiten": "Gleise werden heute frisch gebuegelt",
                             "unwetter": "Wolken haben heute schlechte Laune",
                             "streik": "Zuege machen heute Yoga-Pause",
-                            "defekt": "Der Zug braucht erst mal einen Kaffee"
+                            "defekt": "Der Zug braucht erst mal einen Kaffee",
                         }
                         for k2, v2 in fools_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Der Zug macht gerade ein Nickerchen"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Der Zug macht gerade ein Nickerchen"
 
                     elif is_halloween:
                         halloween_map = {
@@ -694,14 +657,11 @@ def _build_feed():
                             "bauarbeiten": "Grabungsarbeiten fuer die Unterwelt",
                             "unwetter": "Ein schreckliches Gewitter zieht auf",
                             "streik": "Skelette machen heute Pause",
-                            "defekt": "Der Zug ist heute verflucht"
+                            "defekt": "Der Zug ist heute verflucht",
                         }
                         for k2, v2 in halloween_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Suesses oder Saures! Der Zug ist heute gruselig langsam"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Suesses oder Saures! Der Zug ist heute gruselig langsam"
 
                     elif is_christmas:
                         xmas_map = {
@@ -718,14 +678,11 @@ def _build_feed():
                             "bauarbeiten": "Wichtelwerkstatt auf den Gleisen",
                             "unwetter": "Rentierschlitten hat Vorfahrt",
                             "streik": "Zuege machen heute Bescherung",
-                            "defekt": "Der Zug braucht eine Portion Gluehwein"
+                            "defekt": "Der Zug braucht eine Portion Gluehwein",
                         }
                         for k2, v2 in xmas_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Frohe Weihnachten! Der Zug geniesst die Feiertage"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Frohe Weihnachten! Der Zug geniesst die Feiertage"
 
                     elif is_new_year:
                         ny_map = {
@@ -742,14 +699,11 @@ def _build_feed():
                             "bauarbeiten": "Gleise werden fuer das neue Jahr poliert",
                             "unwetter": "Gluecksregen zieht auf",
                             "streik": "Zuege machen Neujahrspause",
-                            "defekt": "Der Zug hat einen Kater"
+                            "defekt": "Der Zug hat einen Kater",
                         }
                         for k2, v2 in ny_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Guten Rutsch! Der Zug gleitet ins neue Jahr"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Guten Rutsch! Der Zug gleitet ins neue Jahr"
 
                     elif is_easter:
                         easter_map = {
@@ -766,14 +720,11 @@ def _build_feed():
                             "bauarbeiten": "Osterhasen-Werkstatt auf den Gleisen",
                             "unwetter": "Eierregen zieht auf",
                             "streik": "Zuege machen heute Eiersuche",
-                            "defekt": "Der Zug braucht eine Portion Karotten"
+                            "defekt": "Der Zug braucht eine Portion Karotten",
                         }
                         for k2, v2 in easter_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
 
                     elif is_star_wars:
                         sw_map = {
@@ -790,14 +741,11 @@ def _build_feed():
                             "bauarbeiten": "Todesstern-Konstruktion auf den Gleisen",
                             "unwetter": "Ionensturm im Anmarsch",
                             "streik": "Die Rebellen-Allianz macht heute Pause",
-                            "defekt": "Der Millennium Falke... ich meine der Zug ist kaputt"
+                            "defekt": "Der Millennium Falke... ich meine der Zug ist kaputt",
                         }
                         for k2, v2 in sw_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "May the 4th be with you! Moege die Puenktlichkeit mit uns sein"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "May the 4th be with you! Moege die Puenktlichkeit mit uns sein"
 
                     elif is_vatertag:
                         vater_map = {
@@ -814,14 +762,11 @@ def _build_feed():
                             "bauarbeiten": "Gleise werden heute als Kegelbahn genutzt",
                             "unwetter": "Bierregen zieht auf",
                             "streik": "Zuege machen heute Maennerabend",
-                            "defekt": "Der Zug braucht erst mal ein kuehles Blondes"
+                            "defekt": "Der Zug braucht erst mal ein kuehles Blondes",
                         }
                         for k2, v2 in vater_map.items():
-                            if k2 in rm_lower:
-                                special_msg = v2
-                                break
-                        if not special_msg:
-                            special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
+                            if k2 in rm_lower: special_msg = v2; break
+                        if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
                         desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
@@ -850,18 +795,13 @@ def _build_feed():
 
             lines.append('<item>')
             lines.append(f'<title>{title}</title>')
-            lines.append(
-                f'<description><![CDATA[{desc_text}]]></description>'
-            )
+            lines.append(f'<description><![CDATA[{desc_text}]]></description>')
             lines.append('</item>')
 
     lines.append('</channel>')
     lines.append('</rss>')
 
-    xml_str = "\n".join(lines)
-
-    # In ISO-8859-1 kodieren (Fritz!Fon-kompatibel)
-    return xml_str.encode("iso-8859-1", errors="replace")
+    return "\n".join(lines).encode("iso-8859-1", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -896,17 +836,16 @@ def rss_feed():
 
 @app.route("/health")
 def health():
-    """Health-Check fuer Monitoring."""
     try:
         deps_tuple, _, source = _get_departures()
         cancelled = sum(1 for d in deps_tuple if d.get("cancelled"))
-        delayed = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
+        delayed   = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
         return {
-            "status": "ok",
-            "source": source,
+            "status":     "ok",
+            "source":     source,
             "departures": len(deps_tuple),
-            "cancelled": cancelled,
-            "delayed": delayed,
+            "cancelled":  cancelled,
+            "delayed":    delayed,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
