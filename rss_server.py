@@ -824,6 +824,7 @@ def _build_feed():
                 if desc_parts:
                     desc_parts.append("")
                 for h in hints:
+                    # Allgemeine Infos wie Fahrradmitnahme etc.
                     desc_parts.append(f"Info: {_sanitize(h)}")
 
             if not desc_parts:
