@@ -75,7 +75,7 @@ def _build_session():
     session.mount("http://", adapter)
     session.headers.update({
         "User-Agent": "Wennigsen-RSS-Feed/3.0 "
-                      "(https://wennigsen-rss-feed.onrender.com)"
+                      "(https://abfahrten-wennigsen-bhf.onrender.com)"
     })
     return session
 
