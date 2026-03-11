@@ -1,68 +1,49 @@
-## README.md für dein GitHub‑Repo
+# 🚋 Wennigsen (Deister) Bahnhof RSS-Feed
 
-```markdown
-# 🚋 Wennigsen (Deister) Bahnhof RSS‑Feed
+Optimierter RSS-Feed für **Fritz!Fon** mit Echtzeit-Abfahrten vom Bahnhof Wennigsen (Region Hannover).
 
-Optimiertes RSS‑Feed für **Fritz!Fon** mit Echtzeit‑Abfahrten vom Bahnhof Wennigsen.
+## Live-URL
+```
+https://abfahrten-wennigsen-bhf.onrender.com/feed
+```
 
 ## Features
-- ✅ **Primär**: ÜSTRA‑API (Echtzeit, Plattform, Hinweise)  
-- ✅ **Anreicherung**: DB/VBN (Zwischenhalte, Ausfälle, Remarks)  
-- ✅ **Fallbacks**: DB → VBN  
-- ✅ **Fritz!Fon‑optimiert**: ISO‑8859‑1, Umlaute → ae/oe/ue/ss, kompakte Titel  
-- 🎉 **Easter Eggs**: Feiertags‑spezifische Meldungen (Ostern, Weihnachten, Vatertag, etc.)  
-- 📱 **Health Check**: `/health` für Monitoring  
-
-## Live‑Demo
-```
-https://wennigsen-rss-[dein-random].onrender.com/feed.rss
-```
+- ✅ **Echtzeit-Daten**: ÜSTRA-API für präzise Abfahrtszeiten und Gleisangaben.
+- ✅ **Zusatzinfos**: DB-API für Zwischenhalte, Störungen und detaillierte Zug-Informationen.
+- ✅ **Stale-Cache**: Fallback-Gedächtnis für Zwischenhalte bei API-Ausfällen (gekennzeichnet mit `[offline]`).
+- ✅ **Fritz!Fon-optimiert**: 
+  - ISO-8859-1 Encoding für korrekte Darstellung.
+  - CDATA-Blocks für Sonderzeichen (Pfeile `>` und `<`).
+  - Automatische Umlaut-Konvertierung (ä -> ae etc.).
+  - Anti-Cache-Header für minütliche Aktualisierung.
+- ✅ **Richtungspfeile**: 
+  - `>` für Züge Richtung Hannover.
+  - `<` für Züge weg von Hannover (Haste/Nienburg).
+- 🎉 **Humorvolle Feiertags-Meldungen**: Spezielle Verspätungsgründe für Ostern, Weihnachten, Vatertag, Star Wars Day, etc.
+- 📱 **Health Check**: Leichtgewichtige `/health`-Route für stabiles Deployment auf Render.com.
 
 ## Fritz!Fon Setup
-1. **FRITZ!Box → Telefonie → DECT‑Telefone → [dein Fon] → RSS‑Feed**  
-2. **URL einfügen**: `https://deine-url.onrender.com/feed.rss`  
-3. **Intervall**: 1 Minute  
+1. **FRITZ!Box** → Telefonie → DECT-Telefone → [dein Fon] → RSS-Feed.
+2. **URL einfügen**: `https://abfahrten-wennigsen-bhf.onrender.com/feed`
+3. **Intervall**: 1 Minute.
 4. Fertig! 🥳
 
-## Screenshots
-```
-Titel: 16:03 (+2) | S1 (Gl.1) > Hannover Hbf.
-Beschreibung: +2 Min (plan: 16:03, neu: 16:05)
-Grund: Lokfuehrer sucht noch Ostereier (Personalmangel)
-Halte: 16:10 Seelze Bhf.
-```
+## Anzeige-Format
+**Titel:** `HH:MM (+Verspätung) | Linie (Gleis) [Richtungspfeil] Ziel`  
+**Details:**
+- **Grund:** Verspätungsursache (humorvoll an Feiertagen).
+- **Halte:** Liste der nächsten Stationen (mit `~~` bei Offline-Daten).
+- **Info:** Allgemeine Hinweise (Fahrradmitnahme, etc.).
 
-## Deployment (selbst hosten)
-### Render.com (empfohlen, kostenlos)
-```
-1. Fork dieses Repo
-2. render.com → New → Web Service → GitHub Repo
-3. Build: pip install -r requirements.txt
-4. Start: Procfile übernimmt automatisch
-```
-
-### Lokales Testen
-```bash
-pip install -r requirements.txt
-python app.py
-# http://localhost:5000/feed.rss
-```
-
-## API‑Endpoints
-| Endpoint | Beschreibung |
-|----------|--------------|
-| `/feed.rss` | **Haupt‑RSS‑Feed** (Fritz!Fon) |
-| `/` | Landing Page |
-| `/health` | Status + Stats (Deploy‑Healthcheck) |
+## Deployment
+Das Projekt ist für **Render.com** optimiert:
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `gunicorn rss_server:app`
+- **Python Version:** 3.12.4 (via `runtime.txt`)
 
 ## Datenquellen
-- [ÜSTRA Echtzeit](https://abfahrten.uestra.de)  
-- [DB Transport REST API](https://v6.db.transport.rest)  
-- [VBN Transport REST](https://v6.vbn.transport.rest)
-
-## License
-MIT – tu damit, was du willst! 🎉
+- [ÜSTRA Echtzeit](https://abfahrten.uestra.de)
+- [DB Transport REST API](https://v6.db.transport.rest)
 
 ---
 **Made with ❤️ für Pendler in Wennigsen** | Stand: März 2026
-```
