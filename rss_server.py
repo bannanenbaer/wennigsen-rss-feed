@@ -541,25 +541,59 @@ def _build_feed():
 
             is_train = line.upper().startswith("S") and any(c.isdigit() for c in line)
             arrow = ""
+            
+            # Details sammeln
+            remarks        = dep.get("remarks", [])
+            trip_id        = dep.get("trip_id")
+            trip_remarks   = []
+            stopover_lines = []
+            next_stop_name = ""
+
+            if trip_id and trips_url:
+                so_result = _fetch_stopovers(trip_id, trips_url)
+                if so_result and len(so_result) == 3:
+                    stops, t_remarks, is_stale = so_result
+                    trip_remarks = list(t_remarks)
+                    
+                    # Naechsten Halt fuer Pfeil-Logik bestimmen
+                    if stops:
+                        next_stop_name = stops[0][1].lower()
+                    
+                    if is_stale and stops:
+                        stopover_lines.append("[offline] Halte aus Gedaechtnis:")
+                    for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
+                        s_name_clean = _sanitize(s_name)
+                        if is_stale:
+                            if s_cancelled:
+                                stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
+                            else:
+                                stopover_lines.append(f"~~ | {s_name_clean}")
+                        else:
+                            delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
+                            if s_cancelled:
+                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
+                            else:
+                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
+                    if len(stops) > MAX_STOPS:
+                        stopover_lines.append("... weitere Halte")
+
+            # Pfeil-Logik basierend auf naechstem Halt
             if is_train:
-                dir_lower = direction.lower()
-                # Richtung Hannover (Hbf, Nienburg, Minden, Seelze, Wunstorf)
-                hannover_stations = [
-                    "hannover", "hbf", "hauptbahnhof", "seelze", "letter",
-                    "leinhausen", "nordstadt", "bismarck", "garbsen", "langenhagen",
-                    "nienburg", "minden", "wunstorf", "celle"
-                ]
-                # Richtung Haste (Haste, Barsinghausen, Egestorf)
-                haste_stations = [
-                    "haste", "egestorf", "rodenberg", "barsinghausen", 
-                    "bad nenndorf", "bueckeburg", "stadthagen", "melle"
-                ]
-                if any(st in dir_lower for st in hannover_stations):
+                if "lemmie" in next_stop_name:
                     arrow = _ARROW_RIGHT
-                elif any(st in dir_lower for st in haste_stations):
+                elif "egestorf" in next_stop_name:
                     arrow = _ARROW_LEFT
                 else:
-                    arrow = "-"
+                    # Fallback auf alte Logik falls naechster Halt unbekannt
+                    dir_lower = direction.lower()
+                    hannover_stations = ["hannover", "hbf", "hauptbahnhof", "seelze", "nienburg", "minden", "wunstorf", "celle"]
+                    haste_stations = ["haste", "egestorf", "barsinghausen"]
+                    if any(st in dir_lower for st in hannover_stations):
+                        arrow = _ARROW_RIGHT
+                    elif any(st in dir_lower for st in haste_stations):
+                        arrow = _ARROW_LEFT
+                    else:
+                        arrow = "-"
 
             time_str  = fmt(actual_dt or planned_dt)
             delay_str = ""
@@ -590,35 +624,6 @@ def _build_feed():
                 desc_parts.append(
                     f"+{delay_min} Min (plan: {fmt(planned_dt)}, neu: {fmt(actual_dt)})"
                 )
-
-            remarks        = dep.get("remarks", [])
-            trip_id        = dep.get("trip_id")
-            trip_remarks   = []
-            stopover_lines = []
-
-            if trip_id and trips_url:
-                so_result = _fetch_stopovers(trip_id, trips_url)
-                if so_result and len(so_result) == 3:
-                    stops, t_remarks, is_stale = so_result
-                    trip_remarks = list(t_remarks)
-                    if is_stale and stops:
-                        stopover_lines.append("[offline] Halte aus Gedaechtnis:")
-                    for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
-                        s_name_clean = _sanitize(s_name)
-                        if is_stale:
-                            # Bei stale cache: keine Uhrzeiten anzeigen
-                            if s_cancelled:
-                                stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"~~ | {s_name_clean}")
-                        else:
-                            delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
-                            if s_cancelled:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
-                    if len(stops) > MAX_STOPS:
-                        stopover_lines.append("... weitere Halte")
 
             seen = set()
             all_remarks = []
