@@ -450,6 +450,7 @@ def _get_departures():
                 if db_match.get("trip_id"):
                     cache_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
                     _trip_id_cache[cache_key] = db_match["trip_id"]
+                    log.info("trip_id gespeichert fuer %s %s", norm_line, dep["planned_dt"].strftime("%H:%M"))
             else:
                 # Fallback: trip_id aus Cache laden
                 cache_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
@@ -457,6 +458,8 @@ def _get_departures():
                 if cached_trip:
                     dep["trip_id"] = cached_trip
                     log.info("trip_id aus Cache fuer %s %s", norm_line, dep["planned_dt"].strftime("%H:%M"))
+                else:
+                    log.warning("Keine trip_id fuer %s %s (weder DB noch Cache)", norm_line, dep["planned_dt"].strftime("%H:%M"))
 
             enriched.append(dep)
 
