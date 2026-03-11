@@ -7,7 +7,6 @@ from urllib.parse import quote
 import logging
 import pytz
 import urllib3
-import threading
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -26,39 +25,17 @@ STOP_ID_UESTRA = "25005782"
 STOP_NAME      = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ      = pytz.timezone("Europe/Berlin")
 
-MAX_DEPARTURES      = 20
+MAX_DEPARTURES      = 30
 MAX_STOPS           = 10
-STOPOVER_CACHE_TTL  = 900  # 15 Minuten in Sekunden
+
+# ---------------------------------------------------------------------------
+# Stale-Cache fuer Zwischenhalte (Gedaechtnis bei DB-Ausfall)
+# ---------------------------------------------------------------------------
+_stopovers_memory = {}
 
 # Platzhalter fuer Pfeile (werden NACH XML-Escaping ersetzt)
 _ARROW_RIGHT = "__ARROW_RIGHT__"
 _ARROW_LEFT  = "__ARROW_LEFT__"
-
-# ---------------------------------------------------------------------------
-# Stopover-Cache (thread-safe)
-# ---------------------------------------------------------------------------
-_stopover_cache      = {}   # trip_id -> (timestamp, result)
-_stopover_cache_lock = threading.Lock()
-
-
-def _get_cached_stopovers(trip_id):
-    """Gibt gecachten Stopover zurueck, oder None falls abgelaufen/nicht vorhanden."""
-    with _stopover_cache_lock:
-        entry = _stopover_cache.get(trip_id)
-        if not entry:
-            return None
-        ts, result = entry
-        if (datetime.now().timestamp() - ts) > STOPOVER_CACHE_TTL:
-            del _stopover_cache[trip_id]
-            return None
-        return result
-
-
-def _set_cached_stopovers(trip_id, result):
-    """Speichert Stopover-Ergebnis im Cache."""
-    with _stopover_cache_lock:
-        _stopover_cache[trip_id] = (datetime.now().timestamp(), result)
-
 
 # ---------------------------------------------------------------------------
 # Umlaute ersetzen (Fritz!Fon-kompatibel)
@@ -97,7 +74,7 @@ def _build_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Wennigsen-RSS-Feed/2.3 "
+        "User-Agent": "Wennigsen-RSS-Feed/3.0 "
                       "(https://wennigsen-rss-feed.onrender.com)"
     })
     return session
@@ -106,7 +83,7 @@ def _build_session():
 http = _build_session()
 
 # ---------------------------------------------------------------------------
-# API-URLs (VBN entfernt)
+# API-URLs
 # ---------------------------------------------------------------------------
 UESTRA_URL = "https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST"
 UESTRA_PARAMS = {
@@ -168,7 +145,9 @@ def _extract_platform(bon_str):
 
 def _clean_line_name(raw):
     if raw.startswith("S-Bahn "):
-        return raw[7:]
+        raw = raw[7:]
+    # Leerzeichen in Liniennamen entfernen (z.B. "S 1" -> "S1")
+    raw = raw.replace(" ", "")
     return raw
 
 
@@ -248,7 +227,7 @@ def _fetch_uestra():
 
 
 # ---------------------------------------------------------------------------
-# DB API (VBN komplett entfernt)
+# DB API
 # ---------------------------------------------------------------------------
 def _fetch_db():
     now = datetime.now(BERLIN_TZ)
@@ -305,8 +284,8 @@ def _fetch_db():
                 "direction":  d.get("direction", "---"),
                 "planned_dt": planned_dt,
                 "actual_dt":  actual_dt,
-                "delay":      max(0, int(delay)),
-                "platform":   d.get("platform") or d.get("plannedPlatform") or "",
+                "delay":      delay,
+                "platform":   d.get("platform", ""),
                 "cancelled":  cancelled,
                 "remarks":    remarks_list,
                 "hints":      [],
@@ -323,17 +302,20 @@ def _fetch_db():
 
 
 # ---------------------------------------------------------------------------
-# Zwischenhalte laden (mit Cache + Offline-Fallback)
+# Zwischenhalte laden (mit Gedaechtnis-Fallback bei DB-Ausfall)
 # ---------------------------------------------------------------------------
 def _fetch_stopovers(trip_id, trips_url):
-    if not trip_id or not trips_url:
-        return ()
+    """Zwischenhalte laden. Bei Fehler wird aus dem Gedaechtnis geladen.
+    Gibt ein 3-Tupel zurueck: (stops, trip_remarks, is_stale)
+    is_stale=True bedeutet: Daten stammen aus dem Gedaechtnis.
+    """
+    global _stopovers_memory
 
-    # Cache pruefen
-    cached = _get_cached_stopovers(trip_id)
-    if cached is not None:
-        log.debug("Stopovers aus Cache: %s", trip_id[:40])
-        return cached
+    if not trip_id or not trips_url:
+        cached = _stopovers_memory.get(trip_id)
+        if cached:
+            return (cached[0], cached[1], True)
+        return ()
 
     try:
         encoded = quote(trip_id, safe="")
@@ -343,10 +325,12 @@ def _fetch_stopovers(trip_id, trips_url):
             timeout=6,
         )
         if resp.status_code != 200:
-            log.warning("Stopovers Status %s fuer Trip %s",
+            log.warning("Stopovers Status %s fuer Trip %s - nutze Gedaechtnis",
                         resp.status_code, trip_id[:40])
-            # Offline-Fallback: gecachte Version zurueckgeben (auch wenn abgelaufen)
-            return _get_stale_cache(trip_id)
+            cached = _stopovers_memory.get(trip_id)
+            if cached:
+                return (cached[0], cached[1], True)
+            return ()
 
         trip_data    = resp.json().get("trip", {})
         raw          = trip_data.get("stopovers", [])
@@ -378,47 +362,23 @@ def _fetch_stopovers(trip_id, trips_url):
 
                 stops.append((fmt(arr_actual), sname, s_cancelled, s_delay))
 
-        result = (tuple(stops), tuple(trip_remarks))
+        result_stops   = tuple(stops)
+        result_remarks = tuple(trip_remarks)
 
-        # Im Cache speichern (inkl. "stale" Kopie fuer Offline-Fallback)
-        _set_cached_stopovers(trip_id, result)
-        _set_stale_cache(trip_id, result)
+        # Im Gedaechtnis speichern (max 200 Eintraege)
+        _stopovers_memory[trip_id] = (result_stops, result_remarks)
+        if len(_stopovers_memory) > 200:
+            oldest_key = next(iter(_stopovers_memory))
+            del _stopovers_memory[oldest_key]
 
-        return result
+        return (result_stops, result_remarks, False)
 
     except Exception as e:
-        log.error("Stopovers-Fehler: %s", e)
-        # Offline-Fallback: veraltete Cache-Version
-        return _get_stale_cache(trip_id)
-
-
-# ---------------------------------------------------------------------------
-# Stale-Cache (unveraenderte Kopie als Offline-Fallback)
-# ---------------------------------------------------------------------------
-_stale_cache      = {}   # trip_id -> result (kein TTL, bleibt dauerhaft)
-_stale_cache_lock = threading.Lock()
-
-
-def _get_stale_cache(trip_id):
-    """Gibt veralteten (aber bekannten) Stopover zurueck, mit 'offline'-Markierung."""
-    with _stale_cache_lock:
-        entry = _stale_cache.get(trip_id)
-    if not entry:
+        log.error("Stopovers-Fehler: %s - nutze Gedaechtnis", e)
+        cached = _stopovers_memory.get(trip_id)
+        if cached:
+            return (cached[0], cached[1], True)
         return ()
-
-    stops, remarks = entry
-    # Zeiten als "offline" markieren
-    offline_stops = tuple(
-        (f"offline", name, cancelled, 0)
-        for _, name, cancelled, _ in stops
-    )
-    return (offline_stops, remarks)
-
-
-def _set_stale_cache(trip_id, result):
-    """Speichert dauerhaften Offline-Fallback."""
-    with _stale_cache_lock:
-        _stale_cache[trip_id] = result
 
 
 # ---------------------------------------------------------------------------
@@ -429,11 +389,17 @@ def _get_departures():
     db_deps, trips_url = _fetch_db()
 
     if uestra_deps:
+        # Primaeres Lookup: Linie + Richtung + Zeit
         db_lookup = {}
+        # Sekundaeres Lookup: nur Linie + Zeit (fuer unterschiedliche Richtungsnamen)
+        db_lookup_no_dir = {}
         for d in db_deps:
             if d["planned_dt"]:
-                key = (d["line"], d["direction"], d["planned_dt"].strftime("%H:%M"))
+                norm_line = d["line"].replace(" ", "")
+                key = (norm_line, d["direction"], d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
+                lt_key = (norm_line, d["planned_dt"].strftime("%H:%M"))
+                db_lookup_no_dir.setdefault(lt_key, d)
 
         enriched = []
         for dep in uestra_deps:
@@ -441,16 +407,29 @@ def _get_departures():
                 enriched.append(dep)
                 continue
 
-            base_key = (dep["line"], dep["direction"], dep["planned_dt"].strftime("%H:%M"))
+            norm_line = dep["line"].replace(" ", "")
+            base_key = (norm_line, dep["direction"], dep["planned_dt"].strftime("%H:%M"))
             db_match = db_lookup.get(base_key)
 
             if not db_match:
                 for offset_min in [-2, -1, 1, 2]:
                     alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
-                    alt_key  = (dep["line"], dep["direction"], alt_time.strftime("%H:%M"))
+                    alt_key  = (norm_line, dep["direction"], alt_time.strftime("%H:%M"))
                     db_match = db_lookup.get(alt_key)
                     if db_match:
                         break
+
+            # Fallback: nur Linie + Zeit (ignoriere Richtung)
+            if not db_match:
+                lt_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
+                db_match = db_lookup_no_dir.get(lt_key)
+                if not db_match:
+                    for offset_min in [-2, -1, 1, 2]:
+                        alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
+                        lt_key2 = (norm_line, alt_time.strftime("%H:%M"))
+                        db_match = db_lookup_no_dir.get(lt_key2)
+                        if db_match:
+                            break
 
             if db_match:
                 dep["trip_id"] = db_match.get("trip_id")
@@ -467,11 +446,11 @@ def _get_departures():
         for dep in enriched:
             if dep["planned_dt"]:
                 uestra_keys.add(
-                    (dep["line"], dep["direction"], dep["planned_dt"].strftime("%H:%M"))
+                    (dep["line"].replace(" ", ""), dep["direction"], dep["planned_dt"].strftime("%H:%M"))
                 )
         for d in db_deps:
             if d.get("cancelled") and d["planned_dt"]:
-                key = (d["line"], d["direction"], d["planned_dt"].strftime("%H:%M"))
+                key = (d["line"].replace(" ", ""), d["direction"], d["planned_dt"].strftime("%H:%M"))
                 if key not in uestra_keys:
                     enriched.append(d)
 
@@ -534,6 +513,9 @@ def _build_feed():
     else:
         for dep in departures:
             line       = dep.get("line", "---")
+            # Leerzeichen nach 'Bus' einfuegen falls fehlend (z.B. "Bus580" -> "Bus 580")
+            if line.startswith("Bus") and len(line) > 3 and line[3].isdigit():
+                line = "Bus " + line[3:]
             direction  = _sanitize(dep.get("direction", "---"))
             platform   = dep.get("platform", "")
             cancelled  = dep.get("cancelled", False)
@@ -551,11 +533,13 @@ def _build_feed():
                 dir_lower = direction.lower()
                 hannover_stations = [
                     "hannover", "hbf", "hauptbahnhof", "seelze", "letter",
-                    "leinhausen", "nordstadt", "bismarck", "wunstorf",
-                    "barsinghausen", "garbsen", "langenhagen", "melle",
+                    "leinhausen", "nordstadt", "bismarck",
+                    "garbsen", "langenhagen",
                 ]
                 haste_stations = [
                     "haste", "egestorf", "rodenberg", "nienburg", "minden",
+                    "barsinghausen", "wunstorf", "bad nenndorf", "bueckeburg",
+                    "stadthagen", "melle",
                 ]
                 if any(st in dir_lower for st in hannover_stations):
                     arrow = _ARROW_RIGHT
@@ -580,9 +564,7 @@ def _build_feed():
             else:
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
 
-            title = title.replace("&", "&amp;")
-            title = title.replace("<", "&lt;")
-            title = title.replace(">", "&gt;")
+            # Pfeile direkt einsetzen - title wird in CDATA gewrappt
             title = title.replace(_ARROW_RIGHT, ">")
             title = title.replace(_ARROW_LEFT,  "<")
 
@@ -605,22 +587,25 @@ def _build_feed():
 
             if trip_id and trips_url:
                 so_result = _fetch_stopovers(trip_id, trips_url)
-                if so_result and len(so_result) == 2:
-                    stops, t_remarks = so_result
+                if so_result and len(so_result) == 3:
+                    stops, t_remarks, is_stale = so_result
                     trip_remarks = list(t_remarks)
+                    if is_stale and stops:
+                        stopover_lines.append("[offline] Halte aus Gedaechtnis:")
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
-                        delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
-                        if s_time == "offline":
-                            # Offline-Fallback: Zeiten unbekannt
+                        if is_stale:
+                            # Bei stale cache: keine Uhrzeiten anzeigen
                             if s_cancelled:
-                                stopover_lines.append(f"offline | {s_name_clean} [entfaellt]")
+                                stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
                             else:
-                                stopover_lines.append(f"offline | {s_name_clean}")
-                        elif s_cancelled:
-                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
+                                stopover_lines.append(f"~~ | {s_name_clean}")
                         else:
-                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
+                            delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
+                            if s_cancelled:
+                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
+                            else:
+                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
@@ -637,25 +622,26 @@ def _build_feed():
                 year  = now.year
                 today = now.date()
 
-                a  = year % 19
-                b  = year // 100
-                c  = year % 100
+                # Gaussscher Osteralgorithmus
+                a = year % 19
+                b = year // 100
+                c = year % 100
                 dd = b // 4
-                e  = b % 4
-                f  = (b + 8) // 25
-                g  = (b - f + 1) // 3
-                h  = (19 * a + b - dd - g + 15) % 30
-                i  = c // 4
-                k  = c % 4
-                l  = (32 + 2 * e + 2 * i - h - k) % 7
+                e = b % 4
+                f = (b + 8) // 25
+                g = (b - f + 1) // 3
+                h = (19 * a + b - dd - g + 15) % 30
+                i = c // 4
+                k = c % 4
+                l = (32 + 2 * e + 2 * i - h - k) % 7
                 mm = (a + 11 * h + 22 * l) // 451
                 month_e = (h + l - 7 * mm + 114) // 31
-                day_e   = ((h + l - 7 * mm + 114) % 31) + 1
-
+                day_e = ((h + l - 7 * mm + 114) % 31) + 1
+                
                 easter_sunday = date(year, month_e, day_e)
-                karfreitag    = easter_sunday - timedelta(days=2)
-                ostermontag   = easter_sunday + timedelta(days=1)
-                himmelfahrt   = easter_sunday + timedelta(days=39)
+                karfreitag = easter_sunday - timedelta(days=2)
+                ostermontag = easter_sunday + timedelta(days=1)
+                himmelfahrt = easter_sunday + timedelta(days=39) # Vatertag
 
                 is_april_fools = (m == 4 and d == 1)
                 is_halloween   = (m == 10 and d == 31)
@@ -846,7 +832,7 @@ def _build_feed():
             desc_text = "\n".join(desc_parts)
 
             lines.append('<item>')
-            lines.append(f'<title>{title}</title>')
+            lines.append(f'<title><![CDATA[{title}]]></title>')
             lines.append(f'<description><![CDATA[{desc_text}]]></description>')
             lines.append('</item>')
 
@@ -892,18 +878,12 @@ def health():
         deps_tuple, _, source = _get_departures()
         cancelled = sum(1 for d in deps_tuple if d.get("cancelled"))
         delayed   = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
-        with _stopover_cache_lock:
-            cache_size = len(_stopover_cache)
-        with _stale_cache_lock:
-            stale_size = len(_stale_cache)
         return {
             "status":        "ok",
             "source":        source,
             "departures":    len(deps_tuple),
             "cancelled":     cancelled,
             "delayed":       delayed,
-            "cache_live":    cache_size,
-            "cache_stale":   stale_size,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
