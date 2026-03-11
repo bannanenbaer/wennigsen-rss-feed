@@ -65,8 +65,8 @@ def _sanitize(text):
 def _build_session():
     session = requests.Session()
     retries = Retry(
-        total=2,
-        backoff_factor=0.5,
+        total=1,
+        backoff_factor=0.3,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["GET"],
     )
@@ -156,7 +156,7 @@ def _clean_line_name(raw):
 # ---------------------------------------------------------------------------
 def _fetch_uestra():
     try:
-        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=8)
+        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
         if resp.status_code != 200:
             log.warning("UESTRA Status %s", resp.status_code)
             return []
@@ -236,7 +236,7 @@ def _fetch_db():
             API_DB,
             params={"results": 30, "duration": 180,
                     "remarks": "true", "language": "de"},
-            timeout=10,
+            timeout=6,
         )
         if resp.status_code != 200:
             log.warning("DB Status %s", resp.status_code)
@@ -874,19 +874,8 @@ def rss_feed():
 
 @app.route("/health")
 def health():
-    try:
-        deps_tuple, _, source = _get_departures()
-        cancelled = sum(1 for d in deps_tuple if d.get("cancelled"))
-        delayed   = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
-        return {
-            "status":        "ok",
-            "source":        source,
-            "departures":    len(deps_tuple),
-            "cancelled":     cancelled,
-            "delayed":       delayed,
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}, 500
+    """Leichtgewichtiger Health-Check - antwortet sofort ohne API-Aufrufe."""
+    return {"status": "ok"}
 
 
 if __name__ == "__main__":
