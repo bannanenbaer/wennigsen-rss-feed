@@ -315,7 +315,7 @@ def _fetch_stopovers(trip_id, trips_url):
         cached = _stopovers_memory.get(trip_id)
         if cached:
             return (cached[0], cached[1], True)
-        return ()
+        return ((), (), False)
 
     try:
         encoded = quote(trip_id, safe="")
@@ -330,7 +330,7 @@ def _fetch_stopovers(trip_id, trips_url):
             cached = _stopovers_memory.get(trip_id)
             if cached:
                 return (cached[0], cached[1], True)
-            return ()
+            return ((), (), False)
 
         trip_data    = resp.json().get("trip", {})
         raw          = trip_data.get("stopovers", [])
@@ -378,7 +378,7 @@ def _fetch_stopovers(trip_id, trips_url):
         cached = _stopovers_memory.get(trip_id)
         if cached:
             return (cached[0], cached[1], True)
-        return ()
+        return ((), (), False)
 
 
 # ---------------------------------------------------------------------------
