@@ -7,6 +7,7 @@ from urllib.parse import quote
 import logging
 import pytz
 import urllib3
+import threading
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -20,17 +21,44 @@ log = logging.getLogger("rss_server")
 
 app = Flask(__name__)
 
-STOP_ID_DB = "8006336"
+STOP_ID_DB     = "8006336"
 STOP_ID_UESTRA = "25005782"
-STOP_NAME = "Wennigsen (Deister) Bahnhof"
-BERLIN_TZ = pytz.timezone("Europe/Berlin")
+STOP_NAME      = "Wennigsen (Deister) Bahnhof"
+BERLIN_TZ      = pytz.timezone("Europe/Berlin")
 
-MAX_DEPARTURES = 20
-MAX_STOPS = 10
+MAX_DEPARTURES      = 20
+MAX_STOPS           = 10
+STOPOVER_CACHE_TTL  = 900  # 15 Minuten in Sekunden
 
 # Platzhalter fuer Pfeile (werden NACH XML-Escaping ersetzt)
 _ARROW_RIGHT = "__ARROW_RIGHT__"
 _ARROW_LEFT  = "__ARROW_LEFT__"
+
+# ---------------------------------------------------------------------------
+# Stopover-Cache (thread-safe)
+# ---------------------------------------------------------------------------
+_stopover_cache      = {}   # trip_id -> (timestamp, result)
+_stopover_cache_lock = threading.Lock()
+
+
+def _get_cached_stopovers(trip_id):
+    """Gibt gecachten Stopover zurueck, oder None falls abgelaufen/nicht vorhanden."""
+    with _stopover_cache_lock:
+        entry = _stopover_cache.get(trip_id)
+        if not entry:
+            return None
+        ts, result = entry
+        if (datetime.now().timestamp() - ts) > STOPOVER_CACHE_TTL:
+            del _stopover_cache[trip_id]
+            return None
+        return result
+
+
+def _set_cached_stopovers(trip_id, result):
+    """Speichert Stopover-Ergebnis im Cache."""
+    with _stopover_cache_lock:
+        _stopover_cache[trip_id] = (datetime.now().timestamp(), result)
+
 
 # ---------------------------------------------------------------------------
 # Umlaute ersetzen (Fritz!Fon-kompatibel)
@@ -69,7 +97,7 @@ def _build_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Wennigsen-RSS-Feed/2.2 "
+        "User-Agent": "Wennigsen-RSS-Feed/2.3 "
                       "(https://wennigsen-rss-feed.onrender.com)"
     })
     return session
@@ -78,7 +106,7 @@ def _build_session():
 http = _build_session()
 
 # ---------------------------------------------------------------------------
-# API-URLs
+# API-URLs (VBN entfernt)
 # ---------------------------------------------------------------------------
 UESTRA_URL = "https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST"
 UESTRA_PARAMS = {
@@ -104,9 +132,7 @@ UESTRA_PARAMS = {
 }
 
 API_DB   = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
-API_VBN  = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
-TRIPS_DB  = "https://v6.db.transport.rest/trips"
-TRIPS_VBN = "https://v6.vbn.transport.rest/trips"
+TRIPS_DB = "https://v6.db.transport.rest/trips"
 
 
 # ---------------------------------------------------------------------------
@@ -164,10 +190,10 @@ def _fetch_uestra():
     results = []
 
     for rd in data.get("departures", []):
-        line_name  = _clean_line_name(rd.get("line", "---"))
-        number     = rd.get("number", "")
-        direction  = rd.get("destination", "---")
-        platform   = _extract_platform(rd.get("bon", ""))
+        line_name = _clean_line_name(rd.get("line", "---"))
+        number    = rd.get("number", "")
+        direction = rd.get("destination", "---")
+        platform  = _extract_platform(rd.get("bon", ""))
 
         hints_text = []
         for h in rd.get("hints", []):
@@ -222,91 +248,92 @@ def _fetch_uestra():
 
 
 # ---------------------------------------------------------------------------
-# DB / VBN API
+# DB API (VBN komplett entfernt)
 # ---------------------------------------------------------------------------
-def _fetch_db_or_vbn():
-    apis = [("DB", API_DB, TRIPS_DB), ("VBN", API_VBN, TRIPS_VBN)]
-    now  = datetime.now(BERLIN_TZ)
+def _fetch_db():
+    now = datetime.now(BERLIN_TZ)
+    try:
+        resp = http.get(
+            API_DB,
+            params={"results": 30, "duration": 180,
+                    "remarks": "true", "language": "de"},
+            timeout=10,
+        )
+        if resp.status_code != 200:
+            log.warning("DB Status %s", resp.status_code)
+            return [], None
+        raw = resp.json().get("departures", [])
+        if not raw:
+            log.warning("DB keine Abfahrten.")
+            return [], None
 
-    for name, url, trips_url in apis:
-        try:
-            resp = http.get(
-                url,
-                params={"results": 30, "duration": 180,
-                        "remarks": "true", "language": "de"},
-                timeout=10,
-            )
-            if resp.status_code != 200:
-                log.warning("%s Status %s", name, resp.status_code)
+        results = []
+        for d in raw:
+            cancelled    = d.get("cancelled", False)
+            when_str     = d.get("when") or d.get("plannedWhen")
+            planned_when = d.get("plannedWhen")
+
+            planned_dt = parse_time(planned_when)
+            actual_dt  = parse_time(when_str) if when_str else planned_dt
+
+            if not actual_dt:
+                actual_dt = planned_dt
+            if not planned_dt:
                 continue
-            raw = resp.json().get("departures", [])
-            if not raw:
-                log.warning("%s keine Abfahrten.", name)
+
+            ref = actual_dt or planned_dt
+            if not cancelled and ref < now:
+                continue
+            if cancelled and planned_dt < now:
                 continue
 
-            results = []
-            for d in raw:
-                cancelled   = d.get("cancelled", False)
-                when_str    = d.get("when") or d.get("plannedWhen")
-                planned_when = d.get("plannedWhen")
+            delay = d.get("delay") or 0
+            if not isinstance(delay, (int, float)):
+                delay = 0
 
-                planned_dt = parse_time(planned_when)
-                actual_dt  = parse_time(when_str) if when_str else planned_dt
+            remarks_list = []
+            for rm in d.get("remarks", []):
+                rm_type = rm.get("type", "")
+                rm_text = rm.get("text", "") or rm.get("summary", "")
+                if rm_type in ("warning", "status") and rm_text:
+                    remarks_list.append(rm_text)
 
-                if not actual_dt:
-                    actual_dt = planned_dt
-                if not planned_dt:
-                    continue
+            line_obj = d.get("line", {})
+            results.append({
+                "line":       line_obj.get("name", "---"),
+                "number":     line_obj.get("productName", ""),
+                "direction":  d.get("direction", "---"),
+                "planned_dt": planned_dt,
+                "actual_dt":  actual_dt,
+                "delay":      max(0, int(delay)),
+                "platform":   d.get("platform") or d.get("plannedPlatform") or "",
+                "cancelled":  cancelled,
+                "remarks":    remarks_list,
+                "hints":      [],
+                "source":     "db",
+                "trip_id":    d.get("tripId"),
+            })
 
-                ref = actual_dt or planned_dt
-                if not cancelled and ref < now:
-                    continue
-                if cancelled and planned_dt < now:
-                    continue
+        log.info("DB: %d Abfahrten geladen.", len(results))
+        return results, TRIPS_DB
 
-                delay = d.get("delay") or 0
-                if not isinstance(delay, (int, float)):
-                    delay = 0
-
-                remarks_list = []
-                for rm in d.get("remarks", []):
-                    rm_type = rm.get("type", "")
-                    rm_text = rm.get("text", "") or rm.get("summary", "")
-                    if rm_type in ("warning", "status") and rm_text:
-                        remarks_list.append(rm_text)
-
-                line_obj = d.get("line", {})
-                results.append({
-                    "line":       line_obj.get("name", "---"),
-                    "number":     line_obj.get("productName", ""),
-                    "direction":  d.get("direction", "---"),
-                    "planned_dt": planned_dt,
-                    "actual_dt":  actual_dt,
-                    "delay":      max(0, int(delay)),
-                    "platform":   d.get("platform") or d.get("plannedPlatform") or "",
-                    "cancelled":  cancelled,
-                    "remarks":    remarks_list,
-                    "hints":      [],
-                    "source":     name.lower(),
-                    "trip_id":    d.get("tripId"),
-                })
-
-            if results:
-                log.info("%s: %d Abfahrten geladen.", name, len(results))
-                return results, trips_url
-
-        except Exception as e:
-            log.error("%s fehlgeschlagen: %s", name, e)
-
-    return [], None
+    except Exception as e:
+        log.error("DB fehlgeschlagen: %s", e)
+        return [], None
 
 
 # ---------------------------------------------------------------------------
-# Zwischenhalte laden
+# Zwischenhalte laden (mit Cache + Offline-Fallback)
 # ---------------------------------------------------------------------------
 def _fetch_stopovers(trip_id, trips_url):
     if not trip_id or not trips_url:
         return ()
+
+    # Cache pruefen
+    cached = _get_cached_stopovers(trip_id)
+    if cached is not None:
+        log.debug("Stopovers aus Cache: %s", trip_id[:40])
+        return cached
 
     try:
         encoded = quote(trip_id, safe="")
@@ -318,12 +345,13 @@ def _fetch_stopovers(trip_id, trips_url):
         if resp.status_code != 200:
             log.warning("Stopovers Status %s fuer Trip %s",
                         resp.status_code, trip_id[:40])
-            return ()
+            # Offline-Fallback: gecachte Version zurueckgeben (auch wenn abgelaufen)
+            return _get_stale_cache(trip_id)
 
-        trip_data = resp.json().get("trip", {})
-        raw = trip_data.get("stopovers", [])
-
+        trip_data    = resp.json().get("trip", {})
+        raw          = trip_data.get("stopovers", [])
         trip_remarks = []
+
         for rm in trip_data.get("remarks", []):
             rm_type = rm.get("type", "")
             rm_text = rm.get("text", "") or rm.get("summary", "")
@@ -344,19 +372,53 @@ def _fetch_stopovers(trip_id, trips_url):
                 arr_planned = parse_time(s.get("plannedArrival"))
                 s_cancelled = s.get("cancelled", False)
 
-                # Verspätung in Minuten berechnen
                 s_delay = 0
                 if arr_actual and arr_planned:
                     s_delay = max(0, int((arr_actual - arr_planned).total_seconds()) // 60)
 
-                # (zeit, name, cancelled, delay_min)
                 stops.append((fmt(arr_actual), sname, s_cancelled, s_delay))
 
-        return (tuple(stops), tuple(trip_remarks))
+        result = (tuple(stops), tuple(trip_remarks))
+
+        # Im Cache speichern (inkl. "stale" Kopie fuer Offline-Fallback)
+        _set_cached_stopovers(trip_id, result)
+        _set_stale_cache(trip_id, result)
+
+        return result
 
     except Exception as e:
         log.error("Stopovers-Fehler: %s", e)
+        # Offline-Fallback: veraltete Cache-Version
+        return _get_stale_cache(trip_id)
+
+
+# ---------------------------------------------------------------------------
+# Stale-Cache (unveraenderte Kopie als Offline-Fallback)
+# ---------------------------------------------------------------------------
+_stale_cache      = {}   # trip_id -> result (kein TTL, bleibt dauerhaft)
+_stale_cache_lock = threading.Lock()
+
+
+def _get_stale_cache(trip_id):
+    """Gibt veralteten (aber bekannten) Stopover zurueck, mit 'offline'-Markierung."""
+    with _stale_cache_lock:
+        entry = _stale_cache.get(trip_id)
+    if not entry:
         return ()
+
+    stops, remarks = entry
+    # Zeiten als "offline" markieren
+    offline_stops = tuple(
+        (f"offline", name, cancelled, 0)
+        for _, name, cancelled, _ in stops
+    )
+    return (offline_stops, remarks)
+
+
+def _set_stale_cache(trip_id, result):
+    """Speichert dauerhaften Offline-Fallback."""
+    with _stale_cache_lock:
+        _stale_cache[trip_id] = result
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +426,7 @@ def _fetch_stopovers(trip_id, trips_url):
 # ---------------------------------------------------------------------------
 def _get_departures():
     uestra_deps        = _fetch_uestra()
-    db_deps, trips_url = _fetch_db_or_vbn()
+    db_deps, trips_url = _fetch_db()
 
     if uestra_deps:
         db_lookup = {}
@@ -417,7 +479,7 @@ def _get_departures():
         source_info = "UESTRA + DB"
     elif db_deps:
         final       = db_deps
-        source_info = "DB/VBN (Fallback)"
+        source_info = "DB (Fallback)"
     else:
         final       = []
         source_info = "Keine Daten"
@@ -479,12 +541,10 @@ def _build_feed():
             planned_dt = dep.get("planned_dt")
             actual_dt  = dep.get("actual_dt")
 
-            # Ziel kuerzen
             direction_short = direction.replace("Hauptbahnhof", "Hbf.")
             direction_short = direction_short.replace("Bahnhof", "Bhf.")
             direction_short = _sanitize(direction_short)
 
-            # --- Richtungspfeil (Platzhalter, werden NACH Escaping eingesetzt) ---
             is_train = line.upper().startswith("S") and any(c.isdigit() for c in line)
             arrow = ""
             if is_train:
@@ -498,13 +558,12 @@ def _build_feed():
                     "haste", "egestorf", "rodenberg", "nienburg", "minden",
                 ]
                 if any(st in dir_lower for st in hannover_stations):
-                    arrow = _ARROW_RIGHT   # Platzhalter fuer >
+                    arrow = _ARROW_RIGHT
                 elif any(st in dir_lower for st in haste_stations):
-                    arrow = _ARROW_LEFT    # Platzhalter fuer <
+                    arrow = _ARROW_LEFT
                 else:
                     arrow = "-"
 
-            # Zeitformatierung
             time_str  = fmt(actual_dt or planned_dt)
             delay_str = ""
             if cancelled:
@@ -513,7 +572,6 @@ def _build_feed():
                 delay_min = delay // 60
                 delay_str = f" (+{delay_min})"
 
-            # Titel zusammenbauen
             platform_str  = f"Gl.{platform}" if platform else ""
             platform_part = f" ({platform_str})" if platform_str else ""
 
@@ -522,16 +580,12 @@ def _build_feed():
             else:
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
 
-            # XML-Sonderzeichen escapen (Platzhalter bleiben unveraendert)
             title = title.replace("&", "&amp;")
             title = title.replace("<", "&lt;")
             title = title.replace(">", "&gt;")
-
-            # Jetzt Platzhalter durch echte Pfeile ersetzen
             title = title.replace(_ARROW_RIGHT, ">")
             title = title.replace(_ARROW_LEFT,  "<")
 
-            # --- Beschreibung ---
             desc_parts = []
 
             if cancelled:
@@ -544,8 +598,8 @@ def _build_feed():
                     f"+{delay_min} Min (plan: {fmt(planned_dt)}, neu: {fmt(actual_dt)})"
                 )
 
-            remarks    = dep.get("remarks", [])
-            trip_id    = dep.get("trip_id")
+            remarks        = dep.get("remarks", [])
+            trip_id        = dep.get("trip_id")
             trip_remarks   = []
             stopover_lines = []
 
@@ -557,18 +611,19 @@ def _build_feed():
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
                         delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
-                        if s_cancelled:
-                            stopover_lines.append(
-                                f"{s_time}{delay_part} | {s_name_clean} [entfaellt]"
-                            )
+                        if s_time == "offline":
+                            # Offline-Fallback: Zeiten unbekannt
+                            if s_cancelled:
+                                stopover_lines.append(f"offline | {s_name_clean} [entfaellt]")
+                            else:
+                                stopover_lines.append(f"offline | {s_name_clean}")
+                        elif s_cancelled:
+                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
                         else:
-                            stopover_lines.append(
-                                f"{s_time}{delay_part} | {s_name_clean}"
-                            )
+                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
-            # Duplikate in Remarks entfernen
             seen = set()
             all_remarks = []
             for rm in remarks + trip_remarks:
@@ -578,11 +633,10 @@ def _build_feed():
                     all_remarks.append(rm)
 
             if all_remarks:
-                m, d   = now.month, now.day
-                year   = now.year
-                today  = now.date()
+                m, d  = now.month, now.day
+                year  = now.year
+                today = now.date()
 
-                # Gaussscher Osteralgorithmus
                 a  = year % 19
                 b  = year // 100
                 c  = year % 100
@@ -773,14 +827,12 @@ def _build_feed():
                     else:
                         desc_parts.append(f"Grund: {rm_clean}")
 
-            # Zwischenhalte
             if stopover_lines:
                 if desc_parts:
                     desc_parts.append("")
                 desc_parts.append("Halte:")
                 desc_parts.extend(stopover_lines)
 
-            # Hinweise (UESTRA)
             hints = dep.get("hints", [])
             if hints:
                 if desc_parts:
@@ -840,12 +892,18 @@ def health():
         deps_tuple, _, source = _get_departures()
         cancelled = sum(1 for d in deps_tuple if d.get("cancelled"))
         delayed   = sum(1 for d in deps_tuple if d.get("delay", 0) >= 60)
+        with _stopover_cache_lock:
+            cache_size = len(_stopover_cache)
+        with _stale_cache_lock:
+            stale_size = len(_stale_cache)
         return {
-            "status":     "ok",
-            "source":     source,
-            "departures": len(deps_tuple),
-            "cancelled":  cancelled,
-            "delayed":    delayed,
+            "status":        "ok",
+            "source":        source,
+            "departures":    len(deps_tuple),
+            "cancelled":     cancelled,
+            "delayed":       delayed,
+            "cache_live":    cache_size,
+            "cache_stale":   stale_size,
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}, 500
