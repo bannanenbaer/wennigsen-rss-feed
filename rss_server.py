@@ -627,7 +627,7 @@ def _build_feed():
 
             if is_train:
                 # Pfeile direkt einsetzen (ohne CDATA, da Fritz!Fon das im Titel oft nicht mag)
-                arrow_char = ">" if arrow == _ARROW_RIGHT else ("<" if arrow == _ARROW_LEFT else "-")
+                arrow_char = "→" if arrow == _ARROW_RIGHT else ("←" if arrow == _ARROW_LEFT else "-")
                 title = f"{time_str}{delay_str} | {line}{platform_part} {arrow_char} {direction_short}"
             else:
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
