@@ -389,14 +389,16 @@ def _get_departures():
     db_deps, trips_url = _fetch_db()
 
     if uestra_deps:
-        # Primaeres Lookup: Linie + Richtung + Zeit
+        # Primaeres Lookup: Linie + Richtung (normalisiert) + Zeit
         db_lookup = {}
         # Sekundaeres Lookup: nur Linie + Zeit (fuer unterschiedliche Richtungsnamen)
         db_lookup_no_dir = {}
         for d in db_deps:
             if d["planned_dt"]:
                 norm_line = d["line"].replace(" ", "")
-                key = (norm_line, d["direction"], d["planned_dt"].strftime("%H:%M"))
+                # Richtung normalisieren (nur erste 10 Zeichen, kleingeschrieben)
+                norm_dir = d["direction"][:10].lower()
+                key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
                 lt_key = (norm_line, d["planned_dt"].strftime("%H:%M"))
                 db_lookup_no_dir.setdefault(lt_key, d)
@@ -408,13 +410,14 @@ def _get_departures():
                 continue
 
             norm_line = dep["line"].replace(" ", "")
-            base_key = (norm_line, dep["direction"], dep["planned_dt"].strftime("%H:%M"))
+            norm_dir = dep["direction"][:10].lower()
+            base_key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
             db_match = db_lookup.get(base_key)
 
             if not db_match:
                 for offset_min in [-2, -1, 1, 2]:
                     alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
-                    alt_key  = (norm_line, dep["direction"], alt_time.strftime("%H:%M"))
+                    alt_key  = (norm_line, norm_dir, alt_time.strftime("%H:%M"))
                     db_match = db_lookup.get(alt_key)
                     if db_match:
                         break
@@ -841,7 +844,11 @@ def _build_feed():
                     desc_parts.append("")
                 for h in hints:
                     # Allgemeine Infos wie Fahrradmitnahme etc.
-                    desc_parts.append(f"Info: {_sanitize(h)}")
+                    h_clean = _sanitize(h)
+                    # Redundante "Linie S1: " Praefixe entfernen
+                    if ": " in h_clean:
+                        h_clean = h_clean.split(": ", 1)[1]
+                    desc_parts.append(f"Info: {h_clean}")
 
             if not desc_parts:
                 desc_parts.append("Keine weiteren Infos")
