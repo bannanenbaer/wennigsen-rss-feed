@@ -33,6 +33,9 @@ MAX_STOPS           = 10
 # ---------------------------------------------------------------------------
 _stopovers_memory = {}
 
+# Cache fuer trip_ids (Linie+Zeit+Richtung -> trip_id)
+_trip_id_cache = {}
+
 # Platzhalter fuer Pfeile (werden NACH XML-Escaping ersetzt)
 _ARROW_RIGHT = "__ARROW_RIGHT__"
 _ARROW_LEFT  = "__ARROW_LEFT__"
@@ -240,11 +243,11 @@ def _fetch_db():
         )
         if resp.status_code != 200:
             log.warning("DB Status %s", resp.status_code)
-            return [], None
+            return [], TRIPS_DB
         raw = resp.json().get("departures", [])
         if not raw:
             log.warning("DB keine Abfahrten.")
-            return [], None
+            return [], TRIPS_DB
 
         results = []
         for d in raw:
@@ -298,7 +301,7 @@ def _fetch_db():
 
     except Exception as e:
         log.error("DB fehlgeschlagen: %s", e)
-        return [], None
+        return [], TRIPS_DB
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +445,17 @@ def _get_departures():
                     dep["cancelled"] = True
                 if db_match.get("remarks"):
                     dep["remarks"] = list(set(dep["remarks"] + db_match["remarks"]))
+                # trip_id im Cache speichern
+                if db_match.get("trip_id"):
+                    cache_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
+                    _trip_id_cache[cache_key] = db_match["trip_id"]
+            else:
+                # Fallback: trip_id aus Cache laden
+                cache_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
+                cached_trip = _trip_id_cache.get(cache_key)
+                if cached_trip:
+                    dep["trip_id"] = cached_trip
+                    log.info("trip_id aus Cache fuer %s %s", norm_line, dep["planned_dt"].strftime("%H:%M"))
 
             enriched.append(dep)
 
