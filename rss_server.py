@@ -1,24 +1,8 @@
-"""
-RSS-Feed fuer Abfahrten am Bahnhof Wennigsen (Deister).
-
-Architektur:
-- UESTRA-API liefert Abfahrtszeiten + Echtzeitdaten (primaere Quelle)
-- DB-API liefert Zwischenhalte, Ausfaelle, Remarks (Anreicherung)
-- DB-API dient als vollstaendiger Fallback, falls UESTRA ausfaellt
-- VBN-API dient als zweiter Fallback
-
-Fritz!Fon-Kompatibilitaet:
-- Encoding: ISO-8859-1 (Latin-1)
-- Umlaute werden als ae, oe, ue, ss geschrieben
-- CDATA-Bloecke fuer Beschreibungen
-- Kompakte Titel fuer kleines Display
-"""
-
 from flask import Flask, Response
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import xml.etree.ElementTree as ET
 from urllib.parse import quote
 import logging
@@ -43,6 +27,9 @@ STOP_ID_UESTRA = "25005782"
 STOP_NAME = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ = pytz.timezone("Europe/Berlin")
 
+# Maximalanzahl an Abfahrten im Feed (zur Begrenzung von Stopover-Requests)
+MAX_DEPARTURES = 20
+MAX_STOPS = 10  # max. Zwischenhalte in der Beschreibung
 
 
 # ---------------------------------------------------------------------------
@@ -87,8 +74,10 @@ def _build_session():
         "User-Agent": "Wennigsen-RSS-Feed/2.2 "
                       "(https://wennigsen-rss-feed.onrender.com)"
     })
-    session.verify = False
+    # Wenn moeglich: verify = True lassen. Nur abschalten, wenn wirklich noetig.
+    # session.verify = False
     return session
+
 
 http = _build_session()
 
@@ -122,6 +111,7 @@ API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
 API_VBN = f"https://v6.vbn.transport.rest/stops/{STOP_ID_DB}/departures"
 TRIPS_DB = "https://v6.db.transport.rest/trips"
 TRIPS_VBN = "https://v6.vbn.transport.rest/trips"
+
 
 # ---------------------------------------------------------------------------
 # Hilfsfunktionen
@@ -393,7 +383,8 @@ def _get_departures():
         db_lookup = {}
         for d in db_deps:
             if d["planned_dt"]:
-                key = (d["line"], d["planned_dt"].strftime("%H:%M"))
+                # etwas robusteres Matching: Linie + Richtung + Zeit (HH:MM)
+                key = (d["line"], d["direction"], d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
 
         enriched = []
@@ -402,13 +393,14 @@ def _get_departures():
                 enriched.append(dep)
                 continue
 
-            key = (dep["line"], dep["planned_dt"].strftime("%H:%M"))
-            db_match = db_lookup.get(key)
+            base_key = (dep["line"], dep["direction"], dep["planned_dt"].strftime("%H:%M"))
+            db_match = db_lookup.get(base_key)
 
             if not db_match:
-                for offset in [-60, 60, -120, 120]:
-                    alt_time = dep["planned_dt"] + timedelta(seconds=offset)
-                    alt_key = (dep["line"], alt_time.strftime("%H:%M"))
+                # Fallback +/- bis 2 Minuten in 1-Min-Schritten
+                for offset_min in [-2, -1, 1, 2]:
+                    alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
+                    alt_key = (dep["line"], dep["direction"], alt_time.strftime("%H:%M"))
                     db_match = db_lookup.get(alt_key)
                     if db_match:
                         break
@@ -430,11 +422,11 @@ def _get_departures():
         for dep in enriched:
             if dep["planned_dt"]:
                 uestra_keys.add(
-                    (dep["line"], dep["planned_dt"].strftime("%H:%M"))
+                    (dep["line"], dep["direction"], dep["planned_dt"].strftime("%H:%M"))
                 )
         for d in db_deps:
             if d.get("cancelled") and d["planned_dt"]:
-                key = (d["line"], d["planned_dt"].strftime("%H:%M"))
+                key = (d["line"], d["direction"], d["planned_dt"].strftime("%H:%M"))
                 if key not in uestra_keys:
                     enriched.append(d)
 
@@ -455,6 +447,9 @@ def _get_departures():
             1 if x.get("cancelled") else 0,
         ),
     )
+
+    # Anzahl begrenzen (Performance/Stopovers)
+    final_sorted = final_sorted[:MAX_DEPARTURES]
 
     result = (tuple(final_sorted), trips_url, source_info)
     log.info("Feed: %s (%d Abfahrten)", source_info, len(final_sorted))
@@ -478,7 +473,8 @@ def _build_feed():
         if dep.get("cancelled"):
             if dep.get("planned_dt") and dep["planned_dt"] < now - timedelta(minutes=5):
                 continue
-        elif ref_dt and ref_dt < now:
+        elif ref_dt and ref_dt < now - timedelta(minutes=1):
+            # kleine Pufferzeit, damit "gerade abgefahrene" Zuege noch kurz sichtbar bleiben
             continue
         departures.append(dep)
 
@@ -588,7 +584,7 @@ def _build_feed():
                 if so_result and len(so_result) == 2:
                     stops, t_remarks = so_result
                     trip_remarks = list(t_remarks)
-                    for s_time, s_name, s_cancelled in stops:
+                    for s_time, s_name, s_cancelled in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
                         if s_cancelled:
                             stopover_lines.append(
@@ -598,14 +594,25 @@ def _build_feed():
                             stopover_lines.append(
                                 f"{s_time} {s_name_clean}"
                             )
+                    if len(stops) > MAX_STOPS:
+                        stopover_lines.append("... weitere Halte")
 
-            all_remarks = list(dict.fromkeys(remarks + trip_remarks))
+            all_remarks_raw = remarks + trip_remarks
+            # Duplikate grob entfernen
+            seen = set()
+            all_remarks = []
+            for rm in all_remarks_raw:
+                key = rm.strip()
+                if key not in seen:
+                    seen.add(key)
+                    all_remarks.append(rm)
+
             if all_remarks:
                 # --- Stoerungsgruende filtern und Feiertags-Easter-Eggs ---
-                m, d = now_berlin.month, now_berlin.day
-                year = now_berlin.year
-                today = now_berlin.date()
-                
+                m, d = now.month, now.day
+                year = now.year
+                today = now.date()
+
                 # Gaussscher Osteralgorithmus
                 a = year % 19
                 b = year // 100
@@ -621,13 +628,12 @@ def _build_feed():
                 mm = (a + 11 * h + 22 * l) // 451
                 month_e = (h + l - 7 * mm + 114) // 31
                 day_e = ((h + l - 7 * mm + 114) % 31) + 1
-                
-                from datetime import date as _date, timedelta as _td
-                easter_sunday = _date(year, month_e, day_e)
-                karfreitag = easter_sunday - _td(days=2)
-                ostermontag = easter_sunday + _td(days=1)
-                himmelfahrt = easter_sunday + _td(days=39)  # Vatertag
-                
+
+                easter_sunday = date(year, month_e, day_e)
+                karfreitag = easter_sunday - timedelta(days=2)
+                ostermontag = easter_sunday + timedelta(days=1)
+                himmelfahrt = easter_sunday + timedelta(days=39)  # Vatertag
+
                 # Feiertage definieren
                 is_april_fools = (m == 4 and d == 1)
                 is_halloween = (m == 10 and d == 31)
@@ -635,19 +641,19 @@ def _build_feed():
                 is_new_year = (m == 12 and d == 31) or (m == 1 and d == 1)
                 is_star_wars = (m == 5 and d == 4)  # May the 4th
                 is_vatertag = (today == himmelfahrt)
-                
+
                 # Ostern: Karfreitag bis Ostermontag
                 is_easter = (karfreitag <= today <= ostermontag)
 
                 for rm in all_remarks:
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
-                    
+
                     # Unwichtige Meldungen (Aufzuege, etc.) ausfiltern
                     ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
                     if any(kw in rm_lower for kw in ignore_keywords):
                         continue
-                    
+
                     special_msg = None
                     if is_april_fools:
                         fools_map = {
@@ -666,10 +672,13 @@ def _build_feed():
                             "streik": "Zuege machen heute Yoga-Pause",
                             "defekt": "Der Zug braucht erst mal einen Kaffee"
                         }
-                        for k, v in fools_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Der Zug macht gerade ein Nickerchen"
-                    
+                        for k2, v2 in fools_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Der Zug macht gerade ein Nickerchen"
+
                     elif is_halloween:
                         halloween_map = {
                             "personalmangel": "Lokfuehrer wurde von Geistern entfuehrt",
@@ -687,9 +696,12 @@ def _build_feed():
                             "streik": "Skelette machen heute Pause",
                             "defekt": "Der Zug ist heute verflucht"
                         }
-                        for k, v in halloween_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Suesses oder Saures! Der Zug ist heute gruselig langsam"
+                        for k2, v2 in halloween_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Suesses oder Saures! Der Zug ist heute gruselig langsam"
 
                     elif is_christmas:
                         xmas_map = {
@@ -708,9 +720,12 @@ def _build_feed():
                             "streik": "Zuege machen heute Bescherung",
                             "defekt": "Der Zug braucht eine Portion Gluehwein"
                         }
-                        for k, v in xmas_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Frohe Weihnachten! Der Zug geniesst die Feiertage"
+                        for k2, v2 in xmas_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Frohe Weihnachten! Der Zug geniesst die Feiertage"
 
                     elif is_new_year:
                         ny_map = {
@@ -729,9 +744,12 @@ def _build_feed():
                             "streik": "Zuege machen Neujahrspause",
                             "defekt": "Der Zug hat einen Kater"
                         }
-                        for k, v in ny_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Guten Rutsch! Der Zug gleitet ins neue Jahr"
+                        for k2, v2 in ny_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Guten Rutsch! Der Zug gleitet ins neue Jahr"
 
                     elif is_easter:
                         easter_map = {
@@ -750,9 +768,12 @@ def _build_feed():
                             "streik": "Zuege machen heute Eiersuche",
                             "defekt": "Der Zug braucht eine Portion Karotten"
                         }
-                        for k, v in easter_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
+                        for k2, v2 in easter_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Frohe Ostern! Der Zug hoppelt heute etwas langsamer"
 
                     elif is_star_wars:
                         sw_map = {
@@ -771,14 +792,17 @@ def _build_feed():
                             "streik": "Die Rebellen-Allianz macht heute Pause",
                             "defekt": "Der Millennium Falke... ich meine der Zug ist kaputt"
                         }
-                        for k, v in sw_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "May the 4th be with you! Moege die Puenktlichkeit mit uns sein"
+                        for k2, v2 in sw_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "May the 4th be with you! Moege die Puenktlichkeit mit uns sein"
 
                     elif is_vatertag:
                         vater_map = {
                             "personalmangel": "Lokfuehrer ist mit dem Bollerwagen unterwegs",
-                            "signalstoerung": "Signal ist im Biergarten hängengeblieben",
+                            "signalstoerung": "Signal ist im Biergarten haengengeblieben",
                             "personen im gleis": "Vatertags-Tour blockiert die Schienen",
                             "notarzteinsatz": "Zu viel Hopfenkaltschale genossen",
                             "weichendefekt": "Die Weiche macht heute eine Herrentour",
@@ -792,9 +816,12 @@ def _build_feed():
                             "streik": "Zuege machen heute Maennerabend",
                             "defekt": "Der Zug braucht erst mal ein kuehles Blondes"
                         }
-                        for k, v in vater_map.items():
-                            if k in rm_lower: special_msg = v; break
-                        if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
+                        for k2, v2 in vater_map.items():
+                            if k2 in rm_lower:
+                                special_msg = v2
+                                break
+                        if not special_msg:
+                            special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
                         desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
