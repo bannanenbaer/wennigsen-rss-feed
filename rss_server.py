@@ -635,6 +635,7 @@ def _build_feed():
                         stopover_lines.append("[offline] Halte aus Gedaechtnis:")
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
+                        # Jeder Halt bekommt eine eigene Zeile (wird spaeter mit \n zusammengefuegt)
                         if is_stale:
                             if s_cancelled:
                                 stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
@@ -681,8 +682,11 @@ def _build_feed():
             if is_train:
                 # Pfeile direkt einsetzen (ohne CDATA, da Fritz!Fon das im Titel oft nicht mag)
                 arrow_char = ">" if arrow == _ARROW_RIGHT else ("<" if arrow == _ARROW_LEFT else "-")
+                # Titel-Format: Zeit | Linie (Gleis) Pfeil Ziel
+                # WICHTIG: Kein schliessendes > am Ende!
                 title = f"{time_str}{delay_str} | {line}{platform_part} {arrow_char} {direction_short}"
             else:
+                # Bus-Format: Zeit | Linie - Ziel
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
 
             desc_parts = []
@@ -922,10 +926,12 @@ def _build_feed():
             if not desc_parts:
                 desc_parts.append("Keine weiteren Infos")
 
+            # Zeilenumbrueche in CDATA werden vom Fritz!Fon als neue Zeilen interpretiert
             desc_text = "\n".join(desc_parts)
 
             lines.append('<item>')
             # Titel OHNE CDATA, aber mit XML-Escaping fuer Sicherheit
+            # Wir escapen nur &, < und >.
             safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
             lines.append(f'<title>{safe_title}</title>')
             lines.append(f'<description><![CDATA[{desc_text}]]></description>')
