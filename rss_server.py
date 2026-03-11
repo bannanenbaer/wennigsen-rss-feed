@@ -543,15 +543,16 @@ def _build_feed():
             arrow = ""
             if is_train:
                 dir_lower = direction.lower()
+                # Richtung Hannover (Hbf, Nienburg, Minden, Seelze, Wunstorf)
                 hannover_stations = [
                     "hannover", "hbf", "hauptbahnhof", "seelze", "letter",
-                    "leinhausen", "nordstadt", "bismarck",
-                    "garbsen", "langenhagen",
+                    "leinhausen", "nordstadt", "bismarck", "garbsen", "langenhagen",
+                    "nienburg", "minden", "wunstorf", "celle"
                 ]
+                # Richtung Haste (Haste, Barsinghausen, Egestorf)
                 haste_stations = [
-                    "haste", "egestorf", "rodenberg", "nienburg", "minden",
-                    "barsinghausen", "wunstorf", "bad nenndorf", "bueckeburg",
-                    "stadthagen", "melle",
+                    "haste", "egestorf", "rodenberg", "barsinghausen", 
+                    "bad nenndorf", "bueckeburg", "stadthagen", "melle"
                 ]
                 if any(st in dir_lower for st in hannover_stations):
                     arrow = _ARROW_RIGHT
