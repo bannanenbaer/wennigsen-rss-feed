@@ -442,19 +442,31 @@ def _get_departures():
 
             enriched.append(dep)
 
-        uestra_keys = set()
+        # Duplikate vermeiden (Linie + Zeit + Richtung)
+        seen_keys = set()
+        unique_enriched = []
         for dep in enriched:
             if dep["planned_dt"]:
-                uestra_keys.add(
-                    (dep["line"].replace(" ", ""), dep["direction"], dep["planned_dt"].strftime("%H:%M"))
-                )
+                # Normalisierter Key fuer Duplikats-Check
+                norm_line = dep["line"].replace(" ", "")
+                # Nur die ersten 10 Zeichen der Richtung fuer robustes Matching
+                norm_dir = dep["direction"][:10].lower()
+                key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_enriched.append(dep)
+        
+        # Abgesagte Züge von DB hinzufügen, falls noch nicht vorhanden
         for d in db_deps:
             if d.get("cancelled") and d["planned_dt"]:
-                key = (d["line"].replace(" ", ""), d["direction"], d["planned_dt"].strftime("%H:%M"))
-                if key not in uestra_keys:
-                    enriched.append(d)
+                norm_line = d["line"].replace(" ", "")
+                norm_dir = d["direction"][:10].lower()
+                key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    unique_enriched.append(d)
 
-        final       = enriched
+        final       = unique_enriched
         source_info = "UESTRA + DB"
     elif db_deps:
         final       = db_deps
@@ -560,13 +572,11 @@ def _build_feed():
             platform_part = f" ({platform_str})" if platform_str else ""
 
             if is_train:
-                title = f"{time_str}{delay_str} | {line}{platform_part} {arrow} {direction_short}"
+                # Pfeile direkt einsetzen (ohne CDATA, da Fritz!Fon das im Titel oft nicht mag)
+                arrow_char = ">" if arrow == _ARROW_RIGHT else ("<" if arrow == _ARROW_LEFT else "-")
+                title = f"{time_str}{delay_str} | {line}{platform_part} {arrow_char} {direction_short}"
             else:
                 title = f"{time_str}{delay_str} | {line} - {direction_short}"
-
-            # Pfeile direkt einsetzen - title wird in CDATA gewrappt
-            title = title.replace(_ARROW_RIGHT, ">")
-            title = title.replace(_ARROW_LEFT,  "<")
 
             desc_parts = []
 
@@ -833,7 +843,9 @@ def _build_feed():
             desc_text = "\n".join(desc_parts)
 
             lines.append('<item>')
-            lines.append(f'<title><![CDATA[{title}]]></title>')
+            # Titel OHNE CDATA, aber mit XML-Escaping fuer Sicherheit
+            safe_title = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            lines.append(f'<title>{safe_title}</title>')
             lines.append(f'<description><![CDATA[{desc_text}]]></description>')
             lines.append('</item>')
 
