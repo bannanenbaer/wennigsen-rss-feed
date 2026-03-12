@@ -71,34 +71,46 @@ def _fetch_sbahn_announcements():
 
 # ---------------------------------------------------------------------------
 # UESTRA / GVH HAFAS Linienmeldungen
-# S-Bahn: S1, S2
-# Stadtbahn: U1-U13, U17
-# Bus: 100-170 (inkl. 100, 121), 200-254 (inkl. 200),
-#      300-390 (inkl. 382), 500-581, 800-870 (inkl. 800)
+# Reihenfolge: S-Bahn, 300er/500er, Stadtbahn, 100er/200er/800er, Rest
 # ---------------------------------------------------------------------------
 _HAFAS_URL = "https://gvh.hafas.de/hamm"
 _HAFAS_LINES = [
-    # S-Bahn
+    # S-Bahn (Priorität 1)
     "S1", "S2",
-    # Stadtbahn
+    # 300er und 500er Busse (Priorität 2)
+    "300-390", "500-581",
+    # Stadtbahn (Priorität 3)
     "U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "U9",
     "U10", "U11", "U12", "U13", "U17",
-    # Bus-Gruppen (100, 121, 200, 300er, 500er, 800)
-    "100-170", "200-254", "300-390", "500-581", "800-870",
+    # 100er, 200er, 800er Busse (Priorität 4)
+    "100-170", "200-254", "800-870",
+    # Alle anderen Busgruppen (Priorität 5)
+    "400-492", "600-699", "700-799",
 ]
+
+# Prioritäts-Mapping für Sortierung
+_HAFAS_PRIORITY = {
+    "S1": 1, "S2": 1,
+    "300-390": 2, "500-581": 2,
+    "U1": 3, "U2": 3, "U3": 3, "U4": 3, "U5": 3, "U6": 3, "U7": 3,
+    "U8": 3, "U9": 3, "U10": 3, "U11": 3, "U12": 3, "U13": 3, "U17": 3,
+    "100-170": 4, "200-254": 4, "800-870": 4,
+    "400-492": 5, "600-699": 5, "700-799": 5,
+}
 _uestra_cache = {"data": [], "ts": 0, "stale": []}
 _UESTRA_CACHE_TTL = 300  # 5 Minuten
 
 
 def _fetch_uestra_line_messages():
-    """Linienmeldungen fuer S1, S2, S5 von der GVH HAFAS API abrufen."""
+    """Linienmeldungen von der GVH HAFAS API abrufen und nach Priorität sortieren."""
     import time as _time
+    import re
     now_ts = datetime.now(BERLIN_TZ).timestamp()
     if _uestra_cache["data"] and (now_ts - _uestra_cache["ts"]) < _UESTRA_CACHE_TTL:
         return _uestra_cache["data"]
     try:
         seen_titles = set()
-        messages = []
+        messages_with_priority = []
         for line in _HAFAS_LINES:
             payload = {
                 "ver": "1.62",
@@ -143,9 +155,16 @@ def _fetch_uestra_line_messages():
                     text = text.replace("<br>", "\n").replace("<br/>", "\n")
                     text = text.replace("<br />", "\n")
                     # Restliche HTML-Tags entfernen
-                    import re
                     text = re.sub(r"<[^>]+>", "", text)
-                    messages.append({"title": title, "text": text})
+                    priority = _HAFAS_PRIORITY.get(line, 99)
+                    messages_with_priority.append({
+                        "priority": priority,
+                        "title": title,
+                        "text": text
+                    })
+        # Sortiere nach Priorität
+        messages_with_priority.sort(key=lambda x: x["priority"])
+        messages = [{"title": m["title"], "text": m["text"]} for m in messages_with_priority]
         _uestra_cache["data"] = messages
         _uestra_cache["ts"] = now_ts
         if messages:
