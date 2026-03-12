@@ -7,6 +7,7 @@ from urllib.parse import quote
 import logging
 import pytz
 import urllib3
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -32,6 +33,41 @@ MAX_STOPS           = 10
 # Stale-Cache fuer Zwischenhalte (Gedaechtnis bei DB-Ausfall)
 # ---------------------------------------------------------------------------
 _stopovers_memory = {}
+
+# ---------------------------------------------------------------------------
+# S-Bahn Hannover Stoerungsmeldungen (Lauftext-Scraping)
+# ---------------------------------------------------------------------------
+_SBAHN_URL = "https://www.sbahn-hannover.de/"
+_sbahn_cache = {"data": [], "ts": 0, "stale": []}
+_SBAHN_CACHE_TTL = 300  # 5 Minuten
+
+
+def _fetch_sbahn_announcements():
+    """Lauftext-Meldungen von sbahn-hannover.de scrapen."""
+    now_ts = datetime.now(BERLIN_TZ).timestamp()
+    if _sbahn_cache["data"] and (now_ts - _sbahn_cache["ts"]) < _SBAHN_CACHE_TTL:
+        return _sbahn_cache["data"]
+    try:
+        resp = requests.get(_SBAHN_URL, timeout=8, headers={
+            "User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"
+        })
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        items = soup.find_all("li", class_="main-announcements__text")
+        announcements = []
+        for item in items:
+            text = item.get_text(strip=True)
+            if text:
+                announcements.append(text)
+        _sbahn_cache["data"] = announcements
+        _sbahn_cache["ts"] = now_ts
+        if announcements:
+            _sbahn_cache["stale"] = announcements
+        log.info("S-Bahn Meldungen geladen: %d Stueck", len(announcements))
+        return announcements
+    except Exception as e:
+        log.warning("S-Bahn Meldungen Fehler: %s", e)
+        return _sbahn_cache.get("stale", [])
 
 # Cache fuer trip_ids (Linie+Zeit+Richtung -> trip_id)
 _trip_id_cache = {}
@@ -538,6 +574,22 @@ def _build_feed():
     lines.append('<language>de-de</language>')
     lines.append('<ttl>1</ttl>')
     lines.append(f'<lastBuildDate>{now_str}</lastBuildDate>')
+
+    # --- S-Bahn Hannover Lauftext-Meldungen ---
+    sbahn_announcements = _fetch_sbahn_announcements()
+    if sbahn_announcements:
+        lines.append('<item>')
+        if len(sbahn_announcements) == 1:
+            lines.append('<title>!!! S-Bahn Meldung !!!</title>')
+        else:
+            lines.append(f'<title>!!! {len(sbahn_announcements)} S-Bahn Meldungen !!!</title>')
+        desc_parts = []
+        for ann in sbahn_announcements:
+            desc_parts.append(_sanitize(ann))
+            desc_parts.append("")
+        desc_text = "\n".join(desc_parts).strip()
+        lines.append(f'<description><![CDATA[{desc_text}]]></description>')
+        lines.append('</item>')
 
     # --- GROSSSTOERUNGEN erkennen ---
     # Schluesselwoerter fuer Grossstoerungen (Streik, Unwetter etc.)

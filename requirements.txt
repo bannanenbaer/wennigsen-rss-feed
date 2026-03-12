@@ -3,3 +3,4 @@ gunicorn==21.2.0
 requests==2.31.0
 pytz==2024.2
 urllib3==2.2.2
+beautifulsoup4==4.12.3
