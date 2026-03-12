@@ -70,10 +70,21 @@ def _fetch_sbahn_announcements():
         return _sbahn_cache.get("stale", [])
 
 # ---------------------------------------------------------------------------
-# UESTRA / GVH HAFAS Linienmeldungen (S1, S2, S5)
+# UESTRA / GVH HAFAS Linienmeldungen
+# S-Bahn: S1, S2
+# Stadtbahn: U1-U13, U17
+# Bus: 100-170, 200-254, 300-390, 500-581, 800-870
 # ---------------------------------------------------------------------------
 _HAFAS_URL = "https://gvh.hafas.de/hamm"
-_HAFAS_LINES = ["S1", "S2", "S5"]
+_HAFAS_LINES = [
+    # S-Bahn
+    "S1", "S2",
+    # Stadtbahn
+    "U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "U9",
+    "U10", "U11", "U12", "U13", "U17",
+    # Bus-Gruppen
+    "100-170", "200-254", "300-390", "500-581", "800-870",
+]
 _uestra_cache = {"data": [], "ts": 0, "stale": []}
 _UESTRA_CACHE_TTL = 300  # 5 Minuten
 
