@@ -69,6 +69,82 @@ def _fetch_sbahn_announcements():
         log.warning("S-Bahn Meldungen Fehler: %s", e)
         return _sbahn_cache.get("stale", [])
 
+# ---------------------------------------------------------------------------
+# UESTRA / GVH HAFAS Linienmeldungen (S1, S2, S5)
+# ---------------------------------------------------------------------------
+_HAFAS_URL = "https://gvh.hafas.de/hamm"
+_HAFAS_LINES = ["S1", "S2", "S5"]
+_uestra_cache = {"data": [], "ts": 0, "stale": []}
+_UESTRA_CACHE_TTL = 300  # 5 Minuten
+
+
+def _fetch_uestra_line_messages():
+    """Linienmeldungen fuer S1, S2, S5 von der GVH HAFAS API abrufen."""
+    import time as _time
+    now_ts = datetime.now(BERLIN_TZ).timestamp()
+    if _uestra_cache["data"] and (now_ts - _uestra_cache["ts"]) < _UESTRA_CACHE_TTL:
+        return _uestra_cache["data"]
+    try:
+        seen_titles = set()
+        messages = []
+        for line in _HAFAS_LINES:
+            payload = {
+                "ver": "1.62",
+                "lang": "deu",
+                "auth": {"type": "AID", "aid": "IKSEvZ1SsVdfIRSK"},
+                "client": {"id": "HAFAS", "type": "WEB", "name": "webapp",
+                           "l": "vs_webapp", "v": 10109},
+                "formatted": False,
+                "svcReqL": [{
+                    "meth": "LineSearch",
+                    "req": {"grpCtx": line, "reslvHimMsgs": True},
+                    "id": "1|8|"
+                }]
+            }
+            params = {
+                "hciMethod": "LineSearch",
+                "hciVersion": "1.62",
+                "hciClientType": "WEB",
+                "hciClientVersion": "10109",
+                "aid": "IKSEvZ1SsVdfIRSK",
+                "rnd": str(int(_time.time() * 1000))
+            }
+            resp = requests.post(_HAFAS_URL, json=payload, params=params,
+                                 timeout=8, headers={
+                                     "User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)",
+                                     "Content-Type": "application/json",
+                                     "Origin": "https://gvh.hafas.de",
+                                     "Referer": "https://gvh.hafas.de/"
+                                 })
+            resp.raise_for_status()
+            data = resp.json()
+            svc = data.get("svcResL", [{}])[0]
+            res = svc.get("res", {})
+            common = res.get("common", {})
+            him_list = common.get("himL", [])
+            for h in him_list:
+                title = h.get("head", "")
+                if title and title not in seen_titles:
+                    seen_titles.add(title)
+                    # HTML-Tags aus dem Text entfernen
+                    text = h.get("text", "")
+                    text = text.replace("<br>", "\n").replace("<br/>", "\n")
+                    text = text.replace("<br />", "\n")
+                    # Restliche HTML-Tags entfernen
+                    import re
+                    text = re.sub(r"<[^>]+>", "", text)
+                    messages.append({"title": title, "text": text})
+        _uestra_cache["data"] = messages
+        _uestra_cache["ts"] = now_ts
+        if messages:
+            _uestra_cache["stale"] = messages
+        log.info("UESTRA Meldungen geladen: %d Stueck", len(messages))
+        return messages
+    except Exception as e:
+        log.warning("UESTRA Meldungen Fehler: %s", e)
+        return _uestra_cache.get("stale", [])
+
+
 # Cache fuer trip_ids (Linie+Zeit+Richtung -> trip_id)
 _trip_id_cache = {}
 
@@ -994,6 +1070,27 @@ def _build_feed():
             if trip_id:
                 lines.append(f'<!-- trip_id: {trip_id} -->')
             lines.append('</item>')
+
+    # --- UESTRA / GVH Linienmeldungen als LETZTES Item ---
+    uestra_messages = _fetch_uestra_line_messages()
+    if uestra_messages:
+        lines.append('<item>')
+        n_msg = len(uestra_messages)
+        if n_msg == 1:
+            lines.append('<title>--- Aktuelle Meldung ---</title>')
+        else:
+            lines.append(f'<title>--- {n_msg} Aktuelle Meldungen ---</title>')
+        msg_parts = []
+        for msg in uestra_messages:
+            msg_parts.append(_sanitize(msg["title"]))
+            # Ersten Satz des Textes als Kurzinfo
+            text_lines = msg["text"].strip().split("\n")
+            if text_lines:
+                msg_parts.append(_sanitize(text_lines[0]))
+            msg_parts.append("")
+        msg_text = "\n".join(msg_parts).strip()
+        lines.append(f'<description><![CDATA[{msg_text}]]></description>')
+        lines.append('</item>')
 
     lines.append('</channel>')
     lines.append('</rss>')
