@@ -77,13 +77,13 @@ _HAFAS_URL = "https://gvh.hafas.de/hamm"
 _HAFAS_LINES = [
     # S-Bahn (Priorität 1)
     "S1", "S2",
-    # 300er und 500er Busse (Priorität 2)
-    "300-390", "500-581",
+    # 500er und sprinti Busse (Priorität 2)
+    "500-581", "sprinti",
     # Stadtbahn (Priorität 3)
     "U1", "U2", "U3", "U4", "U5", "U6", "U7", "U8", "U9",
     "U10", "U11", "U12", "U13", "U17",
-    # 100er, 200er, 800er Busse (Priorität 4)
-    "100-170", "200-254", "800-870",
+    # 100er, 200er, 300er, 800er Busse (Priorität 4)
+    "300-390", "100-170", "200-254", "800-870",
     # Alle anderen Busgruppen (Priorität 5)
     "400-492", "600-699", "700-799",
 ]
@@ -91,10 +91,10 @@ _HAFAS_LINES = [
 # Prioritäts-Mapping für Sortierung
 _HAFAS_PRIORITY = {
     "S1": 1, "S2": 1,
-    "300-390": 2, "500-581": 2,
+    "500-581": 2, "sprinti": 2,
     "U1": 3, "U2": 3, "U3": 3, "U4": 3, "U5": 3, "U6": 3, "U7": 3,
     "U8": 3, "U9": 3, "U10": 3, "U11": 3, "U12": 3, "U13": 3, "U17": 3,
-    "100-170": 4, "200-254": 4, "800-870": 4,
+    "300-390": 4, "100-170": 4, "200-254": 4, "800-870": 4,
     "400-492": 5, "600-699": 5, "700-799": 5,
 }
 _uestra_cache = {"data": [], "ts": 0, "stale": []}
