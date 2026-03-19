@@ -104,6 +104,34 @@ _uestra_cache = {"data": [], "ts": 0, "stale": []}
 _UESTRA_CACHE_TTL = 300  # 5 Minuten
 
 
+# Keywords fuer Fahrtstoerungen vs. Infrastruktur-Meldungen
+_FAHRSTOERUNG_KEYWORDS = [
+    "schienenersatzverkehr", "sperrung", "ausfall", "umleitung", "fahrtausfall",
+    "streckenabschnitt", "gleiswechsel", "verspaetung", "verzoegerung", "verspätung",
+    "signalstoerung", "oberleitungsschaden", "oberleitungsstoerung", "technische stoerung",
+    "weichendefekt", "weichenstoerung", "streik", "unwetter", "sturm", "blitzschlag",
+    "bahnuebergang", "bahnübergang", "personen im gleis", "notarzteinsatz", "polizeieinsatz",
+    "witterungsbedingt", "bauarbeiten", "generalsanierung", "defekt"
+]
+_INFRASTRUKTUR_KEYWORDS = [
+    "aufzug", "rolltreppe", "fahrstuhl", "treppe", "aufzugsanlage", "rolltreppenanlage",
+    "haltestelle wird verlegt", "bahnsteig verlegt", "haltestelle eingeschraenkt",
+    "fahrkartenautomat", "fahrkartenschalter", "ticketautomat", "schalter",
+    "beleuchtung", "beschilderung", "reinigung", "wartung", "instandhaltung",
+    "barrierefreiheit", "behindertengerecht", "rollstuhl", "blinde", "sehbehinderte"
+]
+
+def _categorize_message(title, text):
+    """Kategorisiere eine Meldung als Fahrstoerung (0) oder Infrastruktur (1)."""
+    combined = (title + " " + text).lower()
+    for kw in _FAHRSTOERUNG_KEYWORDS:
+        if kw in combined:
+            return 0  # Fahrstoerung
+    for kw in _INFRASTRUKTUR_KEYWORDS:
+        if kw in combined:
+            return 1  # Infrastruktur
+    return 0  # Default: Fahrstoerung
+
 def _fetch_uestra_line_messages():
     """Linienmeldungen von der GVH HAFAS API abrufen und nach Priorität sortieren."""
     import time as _time
@@ -160,14 +188,17 @@ def _fetch_uestra_line_messages():
                     # Restliche HTML-Tags entfernen
                     text = re.sub(r"<[^>]+>", "", text)
                     priority = _HAFAS_PRIORITY.get(line, 99)
+                    # Kategorisiere die Meldung (0=Fahrstoerung, 1=Infrastruktur)
+                    category = _categorize_message(title, text)
                     messages_with_priority.append({
                         "priority": priority,
+                        "category": category,
                         "title": title,
                         "text": text
                     })
-        # Sortiere nach Priorität
-        messages_with_priority.sort(key=lambda x: x["priority"])
-        messages = [{"title": m["title"], "text": m["text"]} for m in messages_with_priority]
+        # Sortiere nach Priorität (Liniengruppe), dann nach Kategorie (Fahrstoerung vor Infrastruktur)
+        messages_with_priority.sort(key=lambda x: (x["priority"], x["category"]))
+        messages = [{"title": m["title"], "text": m["text"], "category": m["category"]} for m in messages_with_priority]
         _uestra_cache["data"] = messages
         _uestra_cache["ts"] = now_ts
         if messages:
@@ -1109,7 +1140,10 @@ def _build_feed():
     uestra_messages = _fetch_uestra_line_messages()
     if uestra_messages:
         lines.append('<item>')
-        n_msg = len(uestra_messages)
+        # Trenne Fahrstoerungen (category=0) und Infrastruktur (category=1)
+        fahrstoerungen = [m for m in uestra_messages if m.get("category", 0) == 0]
+        infrastruktur = [m for m in uestra_messages if m.get("category", 0) == 1]
+        n_msg = len(fahrstoerungen) + len(infrastruktur)
         if n_msg == 1:
             lines.append('<title>--- Aktuelle Meldung ---</title>')
         else:
@@ -1124,8 +1158,8 @@ def _build_feed():
             4: "=== 100ER, 200ER UND 800ER BUSSE ===",
             5: "=== SONSTIGE BUSSE ===",
         }
-        for msg in uestra_messages:
-            # Bestimme die Prioritaet basierend auf dem Titel
+        # Zeige zuerst Fahrstoerungen
+        for msg in fahrstoerungen:
             msg_priority = None
             for line, priority in _HAFAS_PRIORITY.items():
                 if line in msg["title"]:
@@ -1133,18 +1167,27 @@ def _build_feed():
                     break
             if msg_priority is None:
                 msg_priority = 99
-            # Fuege Ueberschrift hinzu, wenn sich die Prioritaet aendert
             if msg_priority != current_priority and msg_priority in priority_labels:
-                if msg_parts:  # Nicht am Anfang
+                if msg_parts:
                     msg_parts.append("")
                 msg_parts.append(priority_labels[msg_priority])
                 current_priority = msg_priority
             msg_parts.append(_sanitize(msg["title"]))
-            # Ersten Satz des Textes als Kurzinfo
             text_lines = msg["text"].strip().split("\n")
             if text_lines:
                 msg_parts.append(_sanitize(text_lines[0]))
             msg_parts.append("")
+        # Zeige dann Infrastruktur-Meldungen (falls vorhanden)
+        if infrastruktur:
+            if msg_parts:
+                msg_parts.append("")
+            msg_parts.append("=== INFRASTRUKTUR-MELDUNGEN ===")
+            for msg in infrastruktur:
+                msg_parts.append(_sanitize(msg["title"]))
+                text_lines = msg["text"].strip().split("\n")
+                if text_lines:
+                    msg_parts.append(_sanitize(text_lines[0]))
+                msg_parts.append("")
         msg_text = "\n".join(msg_parts).strip()
         lines.append(f'<description><![CDATA[{msg_text}]]></description>')
         lines.append('</item>')
