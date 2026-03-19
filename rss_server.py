@@ -71,12 +71,14 @@ def _fetch_sbahn_announcements():
 
 # ---------------------------------------------------------------------------
 # UESTRA / GVH HAFAS Linienmeldungen
-# Reihenfolge: S-Bahn, 300er/500er, Stadtbahn, 100er/200er/800er, Rest
+# Reihenfolge: S-Bahn, sprinti, 300er/500er, Stadtbahn, 100er/200er/800er, Rest
 # ---------------------------------------------------------------------------
 _HAFAS_URL = "https://gvh.hafas.de/hamm"
 _HAFAS_LINES = [
     # S-Bahn (Priorität 1)
     "S1", "S2",
+    # sprinti (Priorität 1.5)
+    "SPRINTI",
     # 300er und 500er Busse (Priorität 2)
     "300-390", "500-581",
     # Stadtbahn (Priorität 3)
@@ -91,6 +93,7 @@ _HAFAS_LINES = [
 # Prioritäts-Mapping für Sortierung
 _HAFAS_PRIORITY = {
     "S1": 1, "S2": 1,
+    "SPRINTI": 1.5,
     "300-390": 2, "500-581": 2,
     "U1": 3, "U2": 3, "U3": 3, "U4": 3, "U5": 3, "U6": 3, "U7": 3,
     "U8": 3, "U9": 3, "U10": 3, "U11": 3, "U12": 3, "U13": 3, "U17": 3,
@@ -1112,7 +1115,30 @@ def _build_feed():
         else:
             lines.append(f'<title>--- {n_msg} Aktuelle Meldungen ---</title>')
         msg_parts = []
+        current_priority = None
+        priority_labels = {
+            1: "=== S-BAHN ===",
+            1.5: "=== SPRINTI ===",
+            2: "=== 300ER UND 500ER BUSSE ===",
+            3: "=== STADTBAHNEN ===",
+            4: "=== 100ER, 200ER UND 800ER BUSSE ===",
+            5: "=== SONSTIGE BUSSE ===",
+        }
         for msg in uestra_messages:
+            # Bestimme die Prioritaet basierend auf dem Titel
+            msg_priority = None
+            for line, priority in _HAFAS_PRIORITY.items():
+                if line in msg["title"]:
+                    msg_priority = priority
+                    break
+            if msg_priority is None:
+                msg_priority = 99
+            # Fuege Ueberschrift hinzu, wenn sich die Prioritaet aendert
+            if msg_priority != current_priority and msg_priority in priority_labels:
+                if msg_parts:  # Nicht am Anfang
+                    msg_parts.append("")
+                msg_parts.append(priority_labels[msg_priority])
+                current_priority = msg_priority
             msg_parts.append(_sanitize(msg["title"]))
             # Ersten Satz des Textes als Kurzinfo
             text_lines = msg["text"].strip().split("\n")
