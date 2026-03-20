@@ -962,19 +962,15 @@ def _build_feed_uncached():
                     if is_stale and stops:
                         stopover_lines.append("[Gedaechtnis-Modus: Halte aus besseren Zeiten]")
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
+                        if s_cancelled:
+                            continue  # entfallene Halte nicht anzeigen
                         s_name_clean = _sanitize(s_name)
                         # Jeder Halt bekommt eine eigene Zeile (wird spaeter mit \n zusammengefuegt)
                         if is_stale:
-                            if s_cancelled:
-                                stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"~~ | {s_name_clean}")
+                            stopover_lines.append(f"~~ | {s_name_clean}")
                         else:
-                            delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
-                            if s_cancelled:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
+                            delay_part = f" (+{s_delay})" if s_delay > 0 else ""
+                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
@@ -1243,11 +1239,13 @@ def _build_feed_uncached():
                 desc_parts.extend(stopover_lines)
 
             hints = dep.get("hints", [])
-            if hints:
+            _hints_infra_keywords = ["aufzug", "lift", "rolltreppe", "fahrstuhl"]
+            hints_main  = [h for h in hints if not any(kw in _sanitize(h).lower() for kw in _hints_infra_keywords)]
+            if hints_main:
                 if desc_parts:
                     desc_parts.append("")
                 desc_parts.append("--- Hinweise ---")
-                for h_num, h in enumerate(hints, 1):
+                for h_num, h in enumerate(hints_main, 1):
                     # Allgemeine Infos wie Fahrradmitnahme etc.
                     h_clean = _sanitize(h)
                     # Redundante "Linie S1: " Praefixe entfernen
