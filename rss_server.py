@@ -679,17 +679,12 @@ def _get_departures():
                     if db_match:
                         break
 
-            # Fallback: nur Linie + Zeit (ignoriere Richtung)
+            # Fallback: nur Linie + Zeit (ignoriere Richtung) - NUR exakte Zeit,
+            # kein Offset! Sonst werden Zuege in Gegenrichtung gematcht
+            # (S1 :58 Haste und S1 :00 Hannover liegen nur 2 Minuten auseinander).
             if not db_match:
                 lt_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
                 db_match = db_lookup_no_dir.get(lt_key)
-                if not db_match:
-                    for offset_min in [-2, -1, 1, 2]:
-                        alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
-                        lt_key2 = (norm_line, alt_time.strftime("%H:%M"))
-                        db_match = db_lookup_no_dir.get(lt_key2)
-                        if db_match:
-                            break
 
             if db_match:
                 dep["trip_id"] = db_match.get("trip_id")
