@@ -7,6 +7,8 @@ from urllib.parse import quote
 import logging
 import pytz
 import urllib3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -33,6 +35,37 @@ MAX_STOPS           = 10
 # Stale-Cache fuer Zwischenhalte (Gedaechtnis bei DB-Ausfall)
 # ---------------------------------------------------------------------------
 _stopovers_memory = {}
+
+# ---------------------------------------------------------------------------
+# Feed-Level-Cache (30 Sekunden TTL)
+# ---------------------------------------------------------------------------
+_feed_cache      = {"data": None, "ts": 0.0}
+_feed_cache_lock = threading.Lock()
+_FEED_CACHE_TTL  = 30  # Sekunden
+
+# ---------------------------------------------------------------------------
+# Lustige Fehlermeldungen
+# ---------------------------------------------------------------------------
+_NO_DEPARTURES_MSGS = [
+    ("Der Zug ist wohl ausgebuext",
+     "Alle Zuege befinden sich derzeit auf Abenteuerurlaub. Bitte spaeter nochmal nachschauen."),
+    ("404 Zug nicht gefunden",
+     "Der angeforderte Zug konnte auf diesem Gleis nicht gefunden werden. Bitte spaeter erneut versuchen."),
+    ("Schroedinger's Abfahrtsplan",
+     "Es gibt moeglicherweise Zuege. Oder auch nicht. Die Schachtel ist noch zu."),
+    ("Strecke streikt still",
+     "Die Gleise liegen da, die Zuege nicht. Genauere Auskunft verweigert."),
+    ("Temporaere Zuglosigkeit",
+     "Wennigsen ist gerade zugfrei - geniessen Sie die unerwartete Stille."),
+]
+
+_API_DOWN_MSGS = [
+    "Das Fahrplan-API macht heute Homeoffice (ohne VPN)",
+    "Die Datenbahn ist leider gesperrt",
+    "Der Abfahrtsserver kocht gerade Kaffee",
+    "API antwortet nicht - vermutlich auch im Stau",
+    "Echtzeitdaten auf ungeplanter Erholungspause",
+]
 
 # ---------------------------------------------------------------------------
 # S-Bahn Hannover Stoerungsmeldungen (Lauftext-Scraping)
@@ -288,8 +321,10 @@ UESTRA_PARAMS = {
     "c": 1,
 }
 
-API_DB   = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
-TRIPS_DB = "https://v6.db.transport.rest/trips"
+API_DB        = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+TRIPS_DB      = "https://v6.db.transport.rest/trips"
+TRANSDEV_URL  = "https://efaapi-prod.transdev.de/rapidJSON/XML_DM_REQUEST"
+TRANSDEV_STOP = "de:03241:5782"  # DHID fuer Wennigsen
 
 
 # ---------------------------------------------------------------------------
@@ -334,20 +369,10 @@ def _clean_line_name(raw):
 # ---------------------------------------------------------------------------
 # UESTRA API
 # ---------------------------------------------------------------------------
-def _fetch_uestra():
-    try:
-        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
-        if resp.status_code != 200:
-            log.warning("UESTRA Status %s", resp.status_code)
-            return []
-        data = resp.json()
-    except Exception as e:
-        log.error("UESTRA fehlgeschlagen: %s", e)
-        return []
-
+def _parse_efa_response(data, source_label):
+    """Gemeinsamer Parser fuer EFA-kompatible Antworten (UESTRA und Transdev)."""
     now = datetime.now(BERLIN_TZ)
     results = []
-
     for rd in data.get("departures", []):
         line_name = _clean_line_name(rd.get("line", "---"))
         number    = rd.get("number", "")
@@ -398,11 +423,42 @@ def _fetch_uestra():
                 "cancelled":  False,
                 "remarks":    disruptions[:],
                 "hints":      hints_text[:],
-                "source":     "uestra",
+                "source":     source_label,
                 "trip_id":    None,
             })
+    return results
 
+
+def _fetch_uestra():
+    try:
+        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
+        if resp.status_code != 200:
+            log.warning("UESTRA Status %s", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.error("UESTRA fehlgeschlagen: %s", e)
+        return []
+    results = _parse_efa_response(data, "uestra")
     log.info("UESTRA: %d Abfahrten geladen.", len(results))
+    return results
+
+
+def _fetch_transdev():
+    """Transdev EFA-API als tertiaerer Fallback (gleiche Antwortstruktur wie UESTRA)."""
+    params = dict(UESTRA_PARAMS)
+    params["name_dm"] = TRANSDEV_STOP
+    try:
+        resp = http.get(TRANSDEV_URL, params=params, timeout=5)
+        if resp.status_code != 200:
+            log.warning("Transdev Status %s", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.error("Transdev fehlgeschlagen: %s", e)
+        return []
+    results = _parse_efa_response(data, "transdev")
+    log.info("Transdev: %d Abfahrten geladen.", len(results))
     return results
 
 
@@ -525,10 +581,15 @@ def _fetch_stopovers(trip_id, trips_url):
         found = False
         stops = []
         for s in raw:
-            sid        = str(s.get("stop", {}).get("id", ""))
-            station_id = str(s.get("stop", {}).get("station", {}).get("id", ""))
-            # Wennigsen IDs: 8006336, 638806, 25005782
-            if sid in (STOP_ID_DB, "638806", "25005782") or station_id in (STOP_ID_DB, "638806", "25005782"):
+            stop_obj   = s.get("stop", {})
+            sid        = str(stop_obj.get("id", ""))
+            station_id = str(stop_obj.get("station", {}).get("id", ""))
+            stop_name  = stop_obj.get("name", "").lower()
+            # Wennigsen IDs: 8006336, 638806, 25005782 – plus Namens-Fallback
+            id_match   = (sid in (STOP_ID_DB, "638806", "25005782") or
+                          station_id in (STOP_ID_DB, "638806", "25005782"))
+            name_match = "wennigsen" in stop_name
+            if id_match or name_match:
                 found = True
                 continue
             if found:
@@ -566,8 +627,17 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenfuehren
 # ---------------------------------------------------------------------------
 def _get_departures():
-    uestra_deps        = _fetch_uestra()
-    db_deps, trips_url = _fetch_db()
+    # UESTRA und DB parallel abrufen
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_uestra = pool.submit(_fetch_uestra)
+        f_db     = pool.submit(_fetch_db)
+        uestra_deps        = f_uestra.result()
+        db_deps, trips_url = f_db.result()
+
+    # Transdev als tertiaerer Fallback (nur bei UESTRA-Ausfall)
+    if not uestra_deps:
+        log.warning("UESTRA leer - versuche Transdev-Fallback...")
+        uestra_deps = _fetch_transdev()
 
     if uestra_deps:
         # Primaeres Lookup: Linie + Richtung (normalisiert) + Zeit
@@ -664,8 +734,12 @@ def _get_departures():
                     seen_keys.add(key)
                     unique_enriched.append(d)
 
-        final       = unique_enriched
-        source_info = "UESTRA + DB"
+        final = unique_enriched
+        # Quelle bestimmen (UESTRA, Transdev oder DB)
+        if any(d.get("source") == "transdev" for d in final):
+            source_info = "Transdev + DB (UESTRA-Fallback)"
+        else:
+            source_info = "UESTRA + DB"
     elif db_deps:
         final       = db_deps
         source_info = "DB (Fallback)"
@@ -690,6 +764,22 @@ def _get_departures():
 # RSS-Feed generieren (Fritz!Fon-kompatibel)
 # ---------------------------------------------------------------------------
 def _build_feed():
+    """Cache-Wrapper: gibt fertigen Feed als bytes zurueck (30s TTL)."""
+    now_ts = datetime.now(BERLIN_TZ).timestamp()
+    if _feed_cache["data"] and (now_ts - _feed_cache["ts"]) < _FEED_CACHE_TTL:
+        log.info("Feed aus Cache (%.0fs alt)", now_ts - _feed_cache["ts"])
+        return _feed_cache["data"]
+    with _feed_cache_lock:
+        # Doppelt pruefen nach Lock-Erwerb
+        if _feed_cache["data"] and (now_ts - _feed_cache["ts"]) < _FEED_CACHE_TTL:
+            return _feed_cache["data"]
+        result = _build_feed_uncached()
+        _feed_cache["data"] = result
+        _feed_cache["ts"]   = now_ts
+    return result
+
+
+def _build_feed_uncached():
     deps_tuple, trips_url, source_info = _get_departures()
     now     = datetime.now(BERLIN_TZ)
     now_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -785,10 +875,19 @@ def _build_feed():
         lines.append(f'<description><![CDATA[{d_text}]]></description>')
         lines.append('</item>')
 
-    if not departures:
+    if source_info == "Keine Daten":
+        idx = now.minute % len(_API_DOWN_MSGS)
         lines.append('<item>')
-        lines.append('<title>Keine Abfahrten verfuegbar</title>')
-        lines.append('<description><![CDATA[Alle Datenquellen liefern derzeit keine Abfahrten.]]></description>')
+        lines.append(f'<title>!!! Datenpanne: {_API_DOWN_MSGS[idx]} !!!</title>')
+        lines.append('<description><![CDATA[Echtzeitdaten sind gerade nicht erreichbar.\nBitte in einer Minute nochmal probieren.]]></description>')
+        lines.append('</item>')
+
+    if not departures:
+        idx = now.hour % len(_NO_DEPARTURES_MSGS)
+        funny_title, funny_desc = _NO_DEPARTURES_MSGS[idx]
+        lines.append('<item>')
+        lines.append(f'<title>{funny_title}</title>')
+        lines.append(f'<description><![CDATA[{funny_desc}]]></description>')
         lines.append('</item>')
     else:
         for dep in departures:
@@ -828,8 +927,10 @@ def _build_feed():
                     if stops:
                         next_stop_name = stops[0][1].lower()
                     
+                    if not stops and not is_stale:
+                        stopover_lines.append("[Der Zug verschweigt seine Zwischenhalte - sehr verdaechtig]")
                     if is_stale and stops:
-                        stopover_lines.append("[offline] Halte aus Gedaechtnis:")
+                        stopover_lines.append("[Gedaechtnis-Modus: Halte aus besseren Zeiten]")
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
                         s_name_clean = _sanitize(s_name)
                         # Jeder Halt bekommt eine eigene Zeile (wird spaeter mit \n zusammengefuegt)
