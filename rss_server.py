@@ -366,6 +366,13 @@ def _clean_line_name(raw):
     return raw
 
 
+def _norm_dir(s):
+    """Richtung normalisieren: Leerzeichen entfernen, kleinschreiben, auf 12 Zeichen kuerzen.
+    Sorgt dafuer dass 'Nienburg (Weser)' und 'Nienburg(Weser)' identisch behandelt werden.
+    """
+    return s.replace(" ", "").lower()[:12]
+
+
 # ---------------------------------------------------------------------------
 # UESTRA API
 # ---------------------------------------------------------------------------
@@ -647,8 +654,7 @@ def _get_departures():
         for d in db_deps:
             if d["planned_dt"]:
                 norm_line = d["line"].replace(" ", "")
-                # Richtung normalisieren (nur erste 10 Zeichen, kleingeschrieben)
-                norm_dir = d["direction"][:10].lower()
+                norm_dir  = _norm_dir(d["direction"])
                 key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
                 lt_key = (norm_line, d["planned_dt"].strftime("%H:%M"))
@@ -661,7 +667,7 @@ def _get_departures():
                 continue
 
             norm_line = dep["line"].replace(" ", "")
-            norm_dir = dep["direction"][:10].lower()
+            norm_dir  = _norm_dir(dep["direction"])
             base_key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
             db_match = db_lookup.get(base_key)
 
@@ -717,8 +723,7 @@ def _get_departures():
             if dep["planned_dt"]:
                 # Normalisierter Key fuer Duplikats-Check
                 norm_line = dep["line"].replace(" ", "")
-                # Nur die ersten 10 Zeichen der Richtung fuer robustes Matching
-                norm_dir = dep["direction"][:10].lower()
+                norm_dir  = _norm_dir(dep["direction"])
                 key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -728,7 +733,7 @@ def _get_departures():
         for d in db_deps:
             if d.get("cancelled") and d["planned_dt"]:
                 norm_line = d["line"].replace(" ", "")
-                norm_dir = d["direction"][:10].lower()
+                norm_dir  = _norm_dir(d["direction"])
                 key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -1260,6 +1265,8 @@ def _build_feed_uncached():
             5: "=== SONSTIGE BUSSE ===",
         }
         # Zeige zuerst Fahrstoerungen
+        if fahrstoerungen:
+            msg_parts.append("--- FAHRSTOERUNGEN ---")
         for msg in fahrstoerungen:
             msg_priority = None
             for line, priority in _HAFAS_PRIORITY.items():
@@ -1282,7 +1289,7 @@ def _build_feed_uncached():
         if infrastruktur:
             if msg_parts:
                 msg_parts.append("")
-            msg_parts.append("=== INFRASTRUKTUR-MELDUNGEN ===")
+            msg_parts.append("--- INFRASTRUKTUR ---")
             for msg in infrastruktur:
                 msg_parts.append(_sanitize(msg["title"]))
                 text_lines = msg["text"].strip().split("\n")
