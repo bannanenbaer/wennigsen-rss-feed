@@ -1049,7 +1049,7 @@ def _build_feed_uncached():
                 is_vatertag    = (today == himmelfahrt)
                 is_easter      = (karfreitag <= today <= ostermontag)
 
-                for rm in all_remarks:
+                for rm_num, rm in enumerate(all_remarks, 1):
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
 
@@ -1207,9 +1207,9 @@ def _build_feed_uncached():
                         if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
-                        desc_parts.append(f"{special_msg} ({rm_clean})")
+                        desc_parts.append(f"{rm_num}. {special_msg} ({rm_clean})")
                     else:
-                        desc_parts.append(rm_clean)
+                        desc_parts.append(f"{rm_num}. {rm_clean}")
 
             if stopover_lines:
                 if desc_parts:
@@ -1222,13 +1222,13 @@ def _build_feed_uncached():
                 if desc_parts:
                     desc_parts.append("")
                 desc_parts.append("--- Hinweise ---")
-                for h in hints:
+                for h_num, h in enumerate(hints, 1):
                     # Allgemeine Infos wie Fahrradmitnahme etc.
                     h_clean = _sanitize(h)
                     # Redundante "Linie S1: " Praefixe entfernen
                     if ": " in h_clean:
                         h_clean = h_clean.split(": ", 1)[1]
-                    desc_parts.append(h_clean)
+                    desc_parts.append(f"{h_num}. {h_clean}")
 
             if not desc_parts:
                 desc_parts.append("Keine weiteren Infos")
