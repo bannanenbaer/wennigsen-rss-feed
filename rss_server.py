@@ -1271,8 +1271,8 @@ def _build_feed_uncached():
                 lines.append(f'<!-- trip_id: {trip_id} -->')
             lines.append('</item>')
 
-    # --- UESTRA / GVH Linienmeldungen als LETZTES Item ---
-    uestra_messages = _fetch_uestra_line_messages()
+    # --- UESTRA / GVH Linienmeldungen als LETZTES Item --- (deaktiviert)
+    uestra_messages = []  # _fetch_uestra_line_messages()  # TODO: reaktivieren
     if uestra_messages:
         lines.append('<item>')
         # Trenne Fahrstoerungen (category=0) und Infrastruktur (category=1)
