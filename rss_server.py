@@ -1075,7 +1075,7 @@ def _build_feed_uncached():
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
 
-                    ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
+                    ignore_keywords = ["aufzu", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
                     if any(kw in rm_lower for kw in ignore_keywords):
                         continue
                     rm_num += 1
@@ -1241,7 +1241,7 @@ def _build_feed_uncached():
                 desc_parts.extend(stopover_lines)
 
             hints = dep.get("hints", [])
-            _hints_infra_keywords = ["aufzug", "lift", "rolltreppe", "fahrstuhl"]
+            _hints_infra_keywords = ["aufzu", "lift", "rolltreppe", "fahrstuhl"]
             hints_main  = [h for h in hints if not any(kw in _sanitize(h).lower() for kw in _hints_infra_keywords)]
             if hints_main:
                 if desc_parts:
