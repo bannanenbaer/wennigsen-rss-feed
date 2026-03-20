@@ -1070,13 +1070,15 @@ def _build_feed_uncached():
                 is_vatertag    = (today == himmelfahrt)
                 is_easter      = (karfreitag <= today <= ostermontag)
 
-                for rm_num, rm in enumerate(all_remarks, 1):
+                rm_num = 0
+                for rm in all_remarks:
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
 
                     ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
                     if any(kw in rm_lower for kw in ignore_keywords):
                         continue
+                    rm_num += 1
 
                     special_msg = None
 
