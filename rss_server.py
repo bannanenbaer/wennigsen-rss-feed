@@ -734,6 +734,36 @@ def _get_departures():
                     seen_keys.add(key)
                     unique_enriched.append(d)
 
+        # Zugteilung-Dedup: selbe Linie + selbe Zeit + selbe Richtungsseite
+        # = dieselbe physische Zugfahrt (z.B. S1 20:00 -> Hannover Hbf. UND Wunstorf)
+        _hannover_kw = {"hannover", "wunstorf", "seelze", "nienburg", "minden",
+                        "celle", "langenhagen", "lemmie", "weetzen"}
+        _haste_kw    = {"haste", "egestorf", "barsinghausen"}
+
+        def _dir_side(direction):
+            dl = direction.lower()
+            if any(kw in dl for kw in _hannover_kw): return "h"
+            if any(kw in dl for kw in _haste_kw):    return "e"
+            return "?"
+
+        seen_lt = {}   # (norm_line, time) -> index in zugteilung_dedup
+        zugteilung_dedup = []
+        for dep in unique_enriched:
+            if dep["planned_dt"]:
+                nl  = dep["line"].replace(" ", "")
+                t   = dep["planned_dt"].strftime("%H:%M")
+                lt  = (nl, t)
+                if lt in seen_lt:
+                    existing = zugteilung_dedup[seen_lt[lt]]
+                    if _dir_side(dep["direction"]) == _dir_side(existing["direction"]):
+                        log.info("Zugteilung-Dedup: %s %s ('%s' & '%s')",
+                                 nl, t, existing["direction"], dep["direction"])
+                        continue
+                else:
+                    seen_lt[lt] = len(zugteilung_dedup)
+            zugteilung_dedup.append(dep)
+        unique_enriched = zugteilung_dedup
+
         final = unique_enriched
         # Quelle bestimmen (UESTRA, Transdev oder DB)
         if any(d.get("source") == "transdev" for d in final):
