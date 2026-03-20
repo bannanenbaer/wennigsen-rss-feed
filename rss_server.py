@@ -1013,6 +1013,9 @@ def _build_feed_uncached():
                     all_remarks.append(rm)
 
             if all_remarks:
+                if desc_parts:
+                    desc_parts.append("")
+                desc_parts.append("--- Stoerungsgruende ---")
                 m, d  = now.month, now.day
                 year  = now.year
                 today = now.date()
@@ -1204,27 +1207,28 @@ def _build_feed_uncached():
                         if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
-                        desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
+                        desc_parts.append(f"{special_msg} ({rm_clean})")
                     else:
-                        desc_parts.append(f"Grund: {rm_clean}")
+                        desc_parts.append(rm_clean)
 
             if stopover_lines:
                 if desc_parts:
                     desc_parts.append("")
-                desc_parts.append("Halte:")
+                desc_parts.append("--- Halte ---")
                 desc_parts.extend(stopover_lines)
 
             hints = dep.get("hints", [])
             if hints:
                 if desc_parts:
                     desc_parts.append("")
+                desc_parts.append("--- Hinweise ---")
                 for h in hints:
                     # Allgemeine Infos wie Fahrradmitnahme etc.
                     h_clean = _sanitize(h)
                     # Redundante "Linie S1: " Praefixe entfernen
                     if ": " in h_clean:
                         h_clean = h_clean.split(": ", 1)[1]
-                    desc_parts.append(f"Info: {h_clean}")
+                    desc_parts.append(h_clean)
 
             if not desc_parts:
                 desc_parts.append("Keine weiteren Infos")
@@ -1281,10 +1285,11 @@ def _build_feed_uncached():
                 msg_parts.append(priority_labels[msg_priority])
                 current_priority = msg_priority
             msg_parts.append(_sanitize(msg["title"]))
-            text_lines = msg["text"].strip().split("\n")
-            if text_lines:
-                msg_parts.append(_sanitize(text_lines[0]))
-            msg_parts.append("")
+            for tl in msg["text"].strip().split("\n"):
+                tl_clean = _sanitize(tl.strip())
+                if tl_clean:
+                    msg_parts.append(tl_clean)
+            msg_parts.append("---")
         # Zeige dann Infrastruktur-Meldungen (falls vorhanden)
         if infrastruktur:
             if msg_parts:
@@ -1292,10 +1297,11 @@ def _build_feed_uncached():
             msg_parts.append("--- INFRASTRUKTUR ---")
             for msg in infrastruktur:
                 msg_parts.append(_sanitize(msg["title"]))
-                text_lines = msg["text"].strip().split("\n")
-                if text_lines:
-                    msg_parts.append(_sanitize(text_lines[0]))
-                msg_parts.append("")
+                for tl in msg["text"].strip().split("\n"):
+                    tl_clean = _sanitize(tl.strip())
+                    if tl_clean:
+                        msg_parts.append(tl_clean)
+                msg_parts.append("---")
         msg_text = "\n".join(msg_parts).strip()
         lines.append(f'<description><![CDATA[{msg_text}]]></description>')
         lines.append('</item>')
