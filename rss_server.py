@@ -7,6 +7,8 @@ from urllib.parse import quote
 import logging
 import pytz
 import urllib3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
@@ -33,6 +35,37 @@ MAX_STOPS           = 10
 # Stale-Cache fuer Zwischenhalte (Gedaechtnis bei DB-Ausfall)
 # ---------------------------------------------------------------------------
 _stopovers_memory = {}
+
+# ---------------------------------------------------------------------------
+# Feed-Level-Cache (30 Sekunden TTL)
+# ---------------------------------------------------------------------------
+_feed_cache      = {"data": None, "ts": 0.0}
+_feed_cache_lock = threading.Lock()
+_FEED_CACHE_TTL  = 30  # Sekunden
+
+# ---------------------------------------------------------------------------
+# Lustige Fehlermeldungen
+# ---------------------------------------------------------------------------
+_NO_DEPARTURES_MSGS = [
+    ("Der Zug ist wohl ausgebuext",
+     "Alle Zuege befinden sich derzeit auf Abenteuerurlaub. Bitte spaeter nochmal nachschauen."),
+    ("404 Zug nicht gefunden",
+     "Der angeforderte Zug konnte auf diesem Gleis nicht gefunden werden. Bitte spaeter erneut versuchen."),
+    ("Schroedinger's Abfahrtsplan",
+     "Es gibt moeglicherweise Zuege. Oder auch nicht. Die Schachtel ist noch zu."),
+    ("Strecke streikt still",
+     "Die Gleise liegen da, die Zuege nicht. Genauere Auskunft verweigert."),
+    ("Temporaere Zuglosigkeit",
+     "Wennigsen ist gerade zugfrei - geniessen Sie die unerwartete Stille."),
+]
+
+_API_DOWN_MSGS = [
+    "Das Fahrplan-API macht heute Homeoffice (ohne VPN)",
+    "Die Datenbahn ist leider gesperrt",
+    "Der Abfahrtsserver kocht gerade Kaffee",
+    "API antwortet nicht - vermutlich auch im Stau",
+    "Echtzeitdaten auf ungeplanter Erholungspause",
+]
 
 # ---------------------------------------------------------------------------
 # S-Bahn Hannover Stoerungsmeldungen (Lauftext-Scraping)
@@ -288,8 +321,10 @@ UESTRA_PARAMS = {
     "c": 1,
 }
 
-API_DB   = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
-TRIPS_DB = "https://v6.db.transport.rest/trips"
+API_DB        = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+TRIPS_DB      = "https://v6.db.transport.rest/trips"
+TRANSDEV_URL  = "https://efaapi-prod.transdev.de/rapidJSON/XML_DM_REQUEST"
+TRANSDEV_STOP = "de:03241:5782"  # DHID fuer Wennigsen
 
 
 # ---------------------------------------------------------------------------
@@ -331,23 +366,20 @@ def _clean_line_name(raw):
     return raw
 
 
+def _norm_dir(s):
+    """Richtung normalisieren: Leerzeichen entfernen, kleinschreiben, auf 12 Zeichen kuerzen.
+    Sorgt dafuer dass 'Nienburg (Weser)' und 'Nienburg(Weser)' identisch behandelt werden.
+    """
+    return s.replace(" ", "").lower()[:12]
+
+
 # ---------------------------------------------------------------------------
 # UESTRA API
 # ---------------------------------------------------------------------------
-def _fetch_uestra():
-    try:
-        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
-        if resp.status_code != 200:
-            log.warning("UESTRA Status %s", resp.status_code)
-            return []
-        data = resp.json()
-    except Exception as e:
-        log.error("UESTRA fehlgeschlagen: %s", e)
-        return []
-
+def _parse_efa_response(data, source_label):
+    """Gemeinsamer Parser fuer EFA-kompatible Antworten (UESTRA und Transdev)."""
     now = datetime.now(BERLIN_TZ)
     results = []
-
     for rd in data.get("departures", []):
         line_name = _clean_line_name(rd.get("line", "---"))
         number    = rd.get("number", "")
@@ -398,11 +430,42 @@ def _fetch_uestra():
                 "cancelled":  False,
                 "remarks":    disruptions[:],
                 "hints":      hints_text[:],
-                "source":     "uestra",
+                "source":     source_label,
                 "trip_id":    None,
             })
+    return results
 
+
+def _fetch_uestra():
+    try:
+        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
+        if resp.status_code != 200:
+            log.warning("UESTRA Status %s", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.error("UESTRA fehlgeschlagen: %s", e)
+        return []
+    results = _parse_efa_response(data, "uestra")
     log.info("UESTRA: %d Abfahrten geladen.", len(results))
+    return results
+
+
+def _fetch_transdev():
+    """Transdev EFA-API als tertiaerer Fallback (gleiche Antwortstruktur wie UESTRA)."""
+    params = dict(UESTRA_PARAMS)
+    params["name_dm"] = TRANSDEV_STOP
+    try:
+        resp = http.get(TRANSDEV_URL, params=params, timeout=5)
+        if resp.status_code != 200:
+            log.warning("Transdev Status %s", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        log.error("Transdev fehlgeschlagen: %s", e)
+        return []
+    results = _parse_efa_response(data, "transdev")
+    log.info("Transdev: %d Abfahrten geladen.", len(results))
     return results
 
 
@@ -525,10 +588,15 @@ def _fetch_stopovers(trip_id, trips_url):
         found = False
         stops = []
         for s in raw:
-            sid        = str(s.get("stop", {}).get("id", ""))
-            station_id = str(s.get("stop", {}).get("station", {}).get("id", ""))
-            # Wennigsen IDs: 8006336, 638806, 25005782
-            if sid in (STOP_ID_DB, "638806", "25005782") or station_id in (STOP_ID_DB, "638806", "25005782"):
+            stop_obj   = s.get("stop", {})
+            sid        = str(stop_obj.get("id", ""))
+            station_id = str(stop_obj.get("station", {}).get("id", ""))
+            stop_name  = stop_obj.get("name", "").lower()
+            # Wennigsen IDs: 8006336, 638806, 25005782 – plus Namens-Fallback
+            id_match   = (sid in (STOP_ID_DB, "638806", "25005782") or
+                          station_id in (STOP_ID_DB, "638806", "25005782"))
+            name_match = "wennigsen" in stop_name
+            if id_match or name_match:
                 found = True
                 continue
             if found:
@@ -566,8 +634,17 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenfuehren
 # ---------------------------------------------------------------------------
 def _get_departures():
-    uestra_deps        = _fetch_uestra()
-    db_deps, trips_url = _fetch_db()
+    # UESTRA und DB parallel abrufen
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_uestra = pool.submit(_fetch_uestra)
+        f_db     = pool.submit(_fetch_db)
+        uestra_deps        = f_uestra.result()
+        db_deps, trips_url = f_db.result()
+
+    # Transdev als tertiaerer Fallback (nur bei UESTRA-Ausfall)
+    if not uestra_deps:
+        log.warning("UESTRA leer - versuche Transdev-Fallback...")
+        uestra_deps = _fetch_transdev()
 
     if uestra_deps:
         # Primaeres Lookup: Linie + Richtung (normalisiert) + Zeit
@@ -577,8 +654,7 @@ def _get_departures():
         for d in db_deps:
             if d["planned_dt"]:
                 norm_line = d["line"].replace(" ", "")
-                # Richtung normalisieren (nur erste 10 Zeichen, kleingeschrieben)
-                norm_dir = d["direction"][:10].lower()
+                norm_dir  = _norm_dir(d["direction"])
                 key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
                 db_lookup[key] = d
                 lt_key = (norm_line, d["planned_dt"].strftime("%H:%M"))
@@ -591,7 +667,7 @@ def _get_departures():
                 continue
 
             norm_line = dep["line"].replace(" ", "")
-            norm_dir = dep["direction"][:10].lower()
+            norm_dir  = _norm_dir(dep["direction"])
             base_key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
             db_match = db_lookup.get(base_key)
 
@@ -603,17 +679,12 @@ def _get_departures():
                     if db_match:
                         break
 
-            # Fallback: nur Linie + Zeit (ignoriere Richtung)
+            # Fallback: nur Linie + Zeit (ignoriere Richtung) - NUR exakte Zeit,
+            # kein Offset! Sonst werden Zuege in Gegenrichtung gematcht
+            # (S1 :58 Haste und S1 :00 Hannover liegen nur 2 Minuten auseinander).
             if not db_match:
                 lt_key = (norm_line, dep["planned_dt"].strftime("%H:%M"))
                 db_match = db_lookup_no_dir.get(lt_key)
-                if not db_match:
-                    for offset_min in [-2, -1, 1, 2]:
-                        alt_time = dep["planned_dt"] + timedelta(minutes=offset_min)
-                        lt_key2 = (norm_line, alt_time.strftime("%H:%M"))
-                        db_match = db_lookup_no_dir.get(lt_key2)
-                        if db_match:
-                            break
 
             if db_match:
                 dep["trip_id"] = db_match.get("trip_id")
@@ -647,8 +718,7 @@ def _get_departures():
             if dep["planned_dt"]:
                 # Normalisierter Key fuer Duplikats-Check
                 norm_line = dep["line"].replace(" ", "")
-                # Nur die ersten 10 Zeichen der Richtung fuer robustes Matching
-                norm_dir = dep["direction"][:10].lower()
+                norm_dir  = _norm_dir(dep["direction"])
                 key = (norm_line, norm_dir, dep["planned_dt"].strftime("%H:%M"))
                 if key not in seen_keys:
                     seen_keys.add(key)
@@ -658,14 +728,48 @@ def _get_departures():
         for d in db_deps:
             if d.get("cancelled") and d["planned_dt"]:
                 norm_line = d["line"].replace(" ", "")
-                norm_dir = d["direction"][:10].lower()
+                norm_dir  = _norm_dir(d["direction"])
                 key = (norm_line, norm_dir, d["planned_dt"].strftime("%H:%M"))
                 if key not in seen_keys:
                     seen_keys.add(key)
                     unique_enriched.append(d)
 
-        final       = unique_enriched
-        source_info = "UESTRA + DB"
+        # Zugteilung-Dedup: selbe Linie + selbe Zeit + selbe Richtungsseite
+        # = dieselbe physische Zugfahrt (z.B. S1 20:00 -> Hannover Hbf. UND Wunstorf)
+        _hannover_kw = {"hannover", "wunstorf", "seelze", "nienburg", "minden",
+                        "celle", "langenhagen", "lemmie", "weetzen"}
+        _haste_kw    = {"haste", "egestorf", "barsinghausen"}
+
+        def _dir_side(direction):
+            dl = direction.lower()
+            if any(kw in dl for kw in _hannover_kw): return "h"
+            if any(kw in dl for kw in _haste_kw):    return "e"
+            return "?"
+
+        seen_lt = {}   # (norm_line, time) -> index in zugteilung_dedup
+        zugteilung_dedup = []
+        for dep in unique_enriched:
+            if dep["planned_dt"]:
+                nl  = dep["line"].replace(" ", "")
+                t   = dep["planned_dt"].strftime("%H:%M")
+                lt  = (nl, t)
+                if lt in seen_lt:
+                    existing = zugteilung_dedup[seen_lt[lt]]
+                    if _dir_side(dep["direction"]) == _dir_side(existing["direction"]):
+                        log.info("Zugteilung-Dedup: %s %s ('%s' & '%s')",
+                                 nl, t, existing["direction"], dep["direction"])
+                        continue
+                else:
+                    seen_lt[lt] = len(zugteilung_dedup)
+            zugteilung_dedup.append(dep)
+        unique_enriched = zugteilung_dedup
+
+        final = unique_enriched
+        # Quelle bestimmen (UESTRA, Transdev oder DB)
+        if any(d.get("source") == "transdev" for d in final):
+            source_info = "Transdev + DB (UESTRA-Fallback)"
+        else:
+            source_info = "UESTRA + DB"
     elif db_deps:
         final       = db_deps
         source_info = "DB (Fallback)"
@@ -690,6 +794,22 @@ def _get_departures():
 # RSS-Feed generieren (Fritz!Fon-kompatibel)
 # ---------------------------------------------------------------------------
 def _build_feed():
+    """Cache-Wrapper: gibt fertigen Feed als bytes zurueck (30s TTL)."""
+    now_ts = datetime.now(BERLIN_TZ).timestamp()
+    if _feed_cache["data"] and (now_ts - _feed_cache["ts"]) < _FEED_CACHE_TTL:
+        log.info("Feed aus Cache (%.0fs alt)", now_ts - _feed_cache["ts"])
+        return _feed_cache["data"]
+    with _feed_cache_lock:
+        # Doppelt pruefen nach Lock-Erwerb
+        if _feed_cache["data"] and (now_ts - _feed_cache["ts"]) < _FEED_CACHE_TTL:
+            return _feed_cache["data"]
+        result = _build_feed_uncached()
+        _feed_cache["data"] = result
+        _feed_cache["ts"]   = now_ts
+    return result
+
+
+def _build_feed_uncached():
     deps_tuple, trips_url, source_info = _get_departures()
     now     = datetime.now(BERLIN_TZ)
     now_str = now.strftime("%a, %d %b %Y %H:%M:%S %z")
@@ -785,10 +905,19 @@ def _build_feed():
         lines.append(f'<description><![CDATA[{d_text}]]></description>')
         lines.append('</item>')
 
-    if not departures:
+    if source_info == "Keine Daten":
+        idx = now.minute % len(_API_DOWN_MSGS)
         lines.append('<item>')
-        lines.append('<title>Keine Abfahrten verfuegbar</title>')
-        lines.append('<description><![CDATA[Alle Datenquellen liefern derzeit keine Abfahrten.]]></description>')
+        lines.append(f'<title>!!! Datenpanne: {_API_DOWN_MSGS[idx]} !!!</title>')
+        lines.append('<description><![CDATA[Echtzeitdaten sind gerade nicht erreichbar.\nBitte in einer Minute nochmal probieren.]]></description>')
+        lines.append('</item>')
+
+    if not departures:
+        idx = now.hour % len(_NO_DEPARTURES_MSGS)
+        funny_title, funny_desc = _NO_DEPARTURES_MSGS[idx]
+        lines.append('<item>')
+        lines.append(f'<title>{funny_title}</title>')
+        lines.append(f'<description><![CDATA[{funny_desc}]]></description>')
         lines.append('</item>')
     else:
         for dep in departures:
@@ -828,22 +957,20 @@ def _build_feed():
                     if stops:
                         next_stop_name = stops[0][1].lower()
                     
+                    if not stops and not is_stale:
+                        stopover_lines.append("[Der Zug verschweigt seine Zwischenhalte - sehr verdaechtig]")
                     if is_stale and stops:
-                        stopover_lines.append("[offline] Halte aus Gedaechtnis:")
+                        stopover_lines.append("[Gedaechtnis-Modus: Halte aus besseren Zeiten]")
                     for s_time, s_name, s_cancelled, s_delay in stops[:MAX_STOPS]:
+                        if s_cancelled:
+                            continue  # entfallene Halte nicht anzeigen
                         s_name_clean = _sanitize(s_name)
                         # Jeder Halt bekommt eine eigene Zeile (wird spaeter mit \n zusammengefuegt)
                         if is_stale:
-                            if s_cancelled:
-                                stopover_lines.append(f"~~ | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"~~ | {s_name_clean}")
+                            stopover_lines.append(f"~~ | {s_name_clean}")
                         else:
-                            delay_part   = f" (+{s_delay})" if s_delay > 0 else ""
-                            if s_cancelled:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean} [entfaellt]")
-                            else:
-                                stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
+                            delay_part = f" (+{s_delay})" if s_delay > 0 else ""
+                            stopover_lines.append(f"{s_time}{delay_part} | {s_name_clean}")
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
@@ -907,6 +1034,7 @@ def _build_feed():
                     all_remarks.append(rm)
 
             if all_remarks:
+                remark_lines = []
                 m, d  = now.month, now.day
                 year  = now.year
                 today = now.date()
@@ -940,13 +1068,15 @@ def _build_feed():
                 is_vatertag    = (today == himmelfahrt)
                 is_easter      = (karfreitag <= today <= ostermontag)
 
+                rm_num = 0
                 for rm in all_remarks:
                     rm_clean = _sanitize(rm)
                     rm_lower = rm_clean.lower()
 
-                    ignore_keywords = ["aufzug", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
+                    ignore_keywords = ["aufzu", "lift", "rolltreppe", "wc ", "toilette", "gebaeudeschliessung"]
                     if any(kw in rm_lower for kw in ignore_keywords):
                         continue
+                    rm_num += 1
 
                     special_msg = None
 
@@ -1098,27 +1228,36 @@ def _build_feed():
                         if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
-                        desc_parts.append(f"Grund: {special_msg} ({rm_clean})")
+                        remark_lines.append(f"{rm_num}. {special_msg} ({rm_clean})")
                     else:
-                        desc_parts.append(f"Grund: {rm_clean}")
+                        remark_lines.append(f"{rm_num}. {rm_clean}")
+
+                if remark_lines:
+                    if desc_parts:
+                        desc_parts.append("")
+                    desc_parts.append("--- Stoerungsgruende ---")
+                    desc_parts.extend(remark_lines)
 
             if stopover_lines:
                 if desc_parts:
                     desc_parts.append("")
-                desc_parts.append("Halte:")
+                desc_parts.append("--- Halte ---")
                 desc_parts.extend(stopover_lines)
 
             hints = dep.get("hints", [])
-            if hints:
+            _hints_infra_keywords = ["aufzu", "lift", "rolltreppe", "fahrstuhl"]
+            hints_main  = [h for h in hints if not any(kw in _sanitize(h).lower() for kw in _hints_infra_keywords)]
+            if hints_main:
                 if desc_parts:
                     desc_parts.append("")
-                for h in hints:
+                desc_parts.append("--- Hinweise ---")
+                for h_num, h in enumerate(hints_main, 1):
                     # Allgemeine Infos wie Fahrradmitnahme etc.
                     h_clean = _sanitize(h)
                     # Redundante "Linie S1: " Praefixe entfernen
                     if ": " in h_clean:
                         h_clean = h_clean.split(": ", 1)[1]
-                    desc_parts.append(f"Info: {h_clean}")
+                    desc_parts.append(f"{h_num}. {h_clean}")
 
             if not desc_parts:
                 desc_parts.append("Keine weiteren Infos")
@@ -1136,8 +1275,8 @@ def _build_feed():
                 lines.append(f'<!-- trip_id: {trip_id} -->')
             lines.append('</item>')
 
-    # --- UESTRA / GVH Linienmeldungen als LETZTES Item ---
-    uestra_messages = _fetch_uestra_line_messages()
+    # --- UESTRA / GVH Linienmeldungen als LETZTES Item --- (deaktiviert)
+    uestra_messages = []  # _fetch_uestra_line_messages()  # TODO: reaktivieren
     if uestra_messages:
         lines.append('<item>')
         # Trenne Fahrstoerungen (category=0) und Infrastruktur (category=1)
@@ -1159,6 +1298,8 @@ def _build_feed():
             5: "=== SONSTIGE BUSSE ===",
         }
         # Zeige zuerst Fahrstoerungen
+        if fahrstoerungen:
+            msg_parts.append("--- FAHRSTOERUNGEN ---")
         for msg in fahrstoerungen:
             msg_priority = None
             for line, priority in _HAFAS_PRIORITY.items():
@@ -1173,21 +1314,23 @@ def _build_feed():
                 msg_parts.append(priority_labels[msg_priority])
                 current_priority = msg_priority
             msg_parts.append(_sanitize(msg["title"]))
-            text_lines = msg["text"].strip().split("\n")
-            if text_lines:
-                msg_parts.append(_sanitize(text_lines[0]))
-            msg_parts.append("")
+            for tl in msg["text"].strip().split("\n"):
+                tl_clean = _sanitize(tl.strip())
+                if tl_clean:
+                    msg_parts.append(tl_clean)
+            msg_parts.append("---")
         # Zeige dann Infrastruktur-Meldungen (falls vorhanden)
         if infrastruktur:
             if msg_parts:
                 msg_parts.append("")
-            msg_parts.append("=== INFRASTRUKTUR-MELDUNGEN ===")
+            msg_parts.append("--- INFRASTRUKTUR ---")
             for msg in infrastruktur:
                 msg_parts.append(_sanitize(msg["title"]))
-                text_lines = msg["text"].strip().split("\n")
-                if text_lines:
-                    msg_parts.append(_sanitize(text_lines[0]))
-                msg_parts.append("")
+                for tl in msg["text"].strip().split("\n"):
+                    tl_clean = _sanitize(tl.strip())
+                    if tl_clean:
+                        msg_parts.append(tl_clean)
+                msg_parts.append("---")
         msg_text = "\n".join(msg_parts).strip()
         lines.append(f'<description><![CDATA[{msg_text}]]></description>')
         lines.append('</item>')
