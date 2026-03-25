@@ -1034,9 +1034,7 @@ def _build_feed_uncached():
                     all_remarks.append(rm)
 
             if all_remarks:
-                if desc_parts:
-                    desc_parts.append("")
-                desc_parts.append("--- Stoerungsgruende ---")
+                remark_lines = []
                 m, d  = now.month, now.day
                 year  = now.year
                 today = now.date()
@@ -1230,9 +1228,15 @@ def _build_feed_uncached():
                         if not special_msg: special_msg = "Alles Gute zum Vatertag! Der Zug rollt gemuetlich"
 
                     if special_msg:
-                        desc_parts.append(f"{rm_num}. {special_msg} ({rm_clean})")
+                        remark_lines.append(f"{rm_num}. {special_msg} ({rm_clean})")
                     else:
-                        desc_parts.append(f"{rm_num}. {rm_clean}")
+                        remark_lines.append(f"{rm_num}. {rm_clean}")
+
+                if remark_lines:
+                    if desc_parts:
+                        desc_parts.append("")
+                    desc_parts.append("--- Stoerungsgruende ---")
+                    desc_parts.extend(remark_lines)
 
             if stopover_lines:
                 if desc_parts:
