@@ -1,5 +1,7 @@
 from flask import Flask, Response
 import requests
+import threading
+import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timedelta, date
@@ -1199,6 +1201,31 @@ def _build_feed():
 
 
 # ---------------------------------------------------------------------------
+# Hintergrund-Refresh: Feed alle 10 Minuten proaktiv aktualisieren
+# ---------------------------------------------------------------------------
+_feed_cache = {"xml": None, "ts": 0}
+_FEED_REFRESH_INTERVAL = 600  # 10 Minuten
+
+
+def _refresh_feed_background():
+    """Hintergrund-Thread: Baut den Feed alle 10 Minuten neu auf."""
+    while True:
+        try:
+            log.info("[Hintergrund] Starte Feed-Aktualisierung...")
+            xml_bytes = _build_feed()
+            _feed_cache["xml"] = xml_bytes
+            _feed_cache["ts"] = time.time()
+            log.info("[Hintergrund] Feed erfolgreich aktualisiert.")
+        except Exception as e:
+            log.error("[Hintergrund] Fehler beim Aktualisieren des Feeds: %s", e)
+        time.sleep(_FEED_REFRESH_INTERVAL)
+
+
+# Hintergrund-Thread beim Start starten
+_refresh_thread = threading.Thread(target=_refresh_feed_background, daemon=True)
+_refresh_thread.start()
+
+# ---------------------------------------------------------------------------
 # Flask-Routen
 # ---------------------------------------------------------------------------
 @app.route("/")
@@ -1215,7 +1242,15 @@ def index():
 @app.route("/feed.rss")
 @app.route("/feed")
 def rss_feed():
-    xml_bytes = _build_feed()
+    # Gecachten Feed sofort zurueckgeben (wird alle 10 Min. im Hintergrund aktualisiert)
+    if _feed_cache["xml"] is not None:
+        xml_bytes = _feed_cache["xml"]
+    else:
+        # Erster Aufruf bevor der Hintergrund-Thread fertig ist: direkt bauen
+        log.info("Feed-Cache noch leer - baue Feed direkt...")
+        xml_bytes = _build_feed()
+        _feed_cache["xml"] = xml_bytes
+        _feed_cache["ts"] = time.time()
     return Response(
         xml_bytes,
         mimetype="application/rss+xml",
