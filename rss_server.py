@@ -328,8 +328,8 @@ def _extract_platform(bon_str):
 def _clean_line_name(raw):
     if raw.startswith("S-Bahn "):
         raw = raw[7:]
-    # "Nachtliner" Praefix entfernen (z.B. "NachtlinerN56" -> "N56")
-    if raw.startswith("Nachtliner"):
+    # "Nachtliner" Praefix entfernen (auch mehrfach, z.B. "NachtlinerNachtlinerN56" -> "N56")
+    while raw.startswith("Nachtliner"):
         raw = raw[10:]
     # Leerzeichen in Liniennamen entfernen (z.B. "S 1" -> "S1")
     raw = raw.replace(" ", "")
