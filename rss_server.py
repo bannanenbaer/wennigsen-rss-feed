@@ -1213,6 +1213,7 @@ _FEED_REFRESH_INTERVAL = 600  # 10 Minuten
 def _refresh_feed_background():
     """Hintergrund-Thread: Baut den Feed alle 10 Minuten neu auf."""
     while True:
+        time.sleep(_FEED_REFRESH_INTERVAL)
         try:
             log.info("[Hintergrund] Starte Feed-Aktualisierung...")
             xml_bytes = _build_feed()
@@ -1221,10 +1222,18 @@ def _refresh_feed_background():
             log.info("[Hintergrund] Feed erfolgreich aktualisiert.")
         except Exception as e:
             log.error("[Hintergrund] Fehler beim Aktualisieren des Feeds: %s", e)
-        time.sleep(_FEED_REFRESH_INTERVAL)
 
 
-# Hintergrund-Thread beim Start starten
+# Cache beim Start synchron vorladen, damit sofortige Anfragen nicht blockieren
+log.info("[Startup] Lade Feed-Cache vor...")
+try:
+    _feed_cache["xml"] = _build_feed()
+    _feed_cache["ts"] = time.time()
+    log.info("[Startup] Feed-Cache erfolgreich vorgeladen.")
+except Exception as e:
+    log.error("[Startup] Fehler beim Vorladen des Feed-Cache: %s", e)
+
+# Hintergrund-Thread schlaeft erst, dann aktualisiert er alle 10 Minuten
 _refresh_thread = threading.Thread(target=_refresh_feed_background, daemon=True)
 _refresh_thread.start()
 
@@ -1249,11 +1258,19 @@ def rss_feed():
     if _feed_cache["xml"] is not None:
         xml_bytes = _feed_cache["xml"]
     else:
-        # Erster Aufruf bevor der Hintergrund-Thread fertig ist: direkt bauen
-        log.info("Feed-Cache noch leer - baue Feed direkt...")
-        xml_bytes = _build_feed()
-        _feed_cache["xml"] = xml_bytes
-        _feed_cache["ts"] = time.time()
+        # Sollte nach synchronem Startup-Vorladen nicht vorkommen - Platzhalter zurueckgeben
+        log.warning("Feed-Cache leer - sende Platzhalter")
+        placeholder = (
+            '<?xml version="1.0" encoding="iso-8859-1"?>'
+            '<rss version="2.0"><channel>'
+            '<title>Wennigsen (Deister) Bahnhof</title>'
+            '<link>https://abfahrten-wennigsen-bhf.onrender.com</link>'
+            '<description>Abfahrten Wennigsen (Deister)</description>'
+            '<item><title>Daten werden geladen...</title>'
+            '<description><![CDATA[Bitte in Kuerze erneut versuchen.]]></description></item>'
+            '</channel></rss>'
+        )
+        xml_bytes = placeholder.encode("iso-8859-1")
     return Response(
         xml_bytes,
         mimetype="application/rss+xml",
