@@ -1,7 +1,15 @@
 services:
   wennigsen:
     build:
-      context: https://github.com/bannanenbaer/wennigsen-rss-feed/archive/refs/heads/main.tar.gz
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+        WORKDIR /app
+        RUN pip install --no-cache-dir Flask==3.0.0 gunicorn==21.2.0 requests==2.31.0 pytz==2024.2 urllib3==2.2.2 beautifulsoup4==4.12.3
+        RUN printf '#!/bin/sh\nset -e\ngit clone --depth=1 https://github.com/bannanenbaer/wennigsen-rss-feed.git /tmp/repo\ncp /tmp/repo/rss_server.py /app/rss_server.py\nrm -rf /tmp/repo\nexec gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 60 --preload rss_server:app\n' > /app/start.sh && chmod +x /app/start.sh
+        EXPOSE 5000
+        CMD ["/app/start.sh"]
     restart: unless-stopped
     ports:
       - "5002:5000"
