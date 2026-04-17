@@ -1,6 +1,7 @@
 services:
   wennigsen:
     image: ghcr.io/bannanenbaer/wennigsen-rss-feed:latest
+    pull_policy: always
     restart: unless-stopped
     ports:
       - "5002:5000"
