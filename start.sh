@@ -7,4 +7,11 @@ cp /tmp/repo/rss_server.py /app/rss_server.py
 rm -rf /tmp/repo
 echo "[Start] Code aktualisiert. Starte Gunicorn..."
 
-exec gunicorn --bind 0.0.0.0:5000 --workers 2 --timeout 60 rss_server:app
+exec gunicorn \
+  --bind 0.0.0.0:5000 \
+  --workers 2 \
+  --timeout 60 \
+  --preload \
+  --max-requests 1000 \
+  --max-requests-jitter 100 \
+  rss_server:app
