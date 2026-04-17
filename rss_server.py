@@ -464,7 +464,7 @@ def _fetch_db():
 
             line_obj = d.get("line", {})
             results.append({
-                "line":       line_obj.get("name", "---"),
+                "line":       _clean_line_name(line_obj.get("name", "---")),
                 "number":     line_obj.get("productName", ""),
                 "direction":  d.get("direction", "---"),
                 "planned_dt": planned_dt,
