@@ -1,4 +1,5 @@
 from flask import Flask, Response
+import re
 import requests
 import threading
 import time
@@ -798,6 +799,8 @@ def _build_feed():
     else:
         for dep in departures:
             line       = dep.get("line", "---")
+            # Alle "Nacht*"-Woerter aus dem Linienname entfernen (Fangkorb fuer API-Ungereimtheiten)
+            line = re.sub(r'Nacht\w*', '', line).strip()
             # Leerzeichen nach 'Bus' einfuegen falls fehlend (z.B. "Bus580" -> "Bus 580")
             if line.startswith("Bus") and len(line) > 3 and line[3].isdigit():
                 line = "Bus " + line[3:]
