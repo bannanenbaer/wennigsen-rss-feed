@@ -798,9 +798,7 @@ def _build_feed():
         lines.append('</item>')
     else:
         for dep in departures:
-            line       = dep.get("line", "---")
-            # Alle "Nacht*"-Woerter aus dem Linienname entfernen (Fangkorb fuer API-Ungereimtheiten)
-            line = re.sub(r'Nacht\w*', '', line).strip()
+            line       = _clean_line_name(dep.get("line", "---"))
             # Leerzeichen nach 'Bus' einfuegen falls fehlend (z.B. "Bus580" -> "Bus 580")
             if line.startswith("Bus") and len(line) > 3 and line[3].isdigit():
                 line = "Bus " + line[3:]
