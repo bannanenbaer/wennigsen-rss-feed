@@ -357,6 +357,8 @@ def _fetch_uestra():
     for rd in data.get("departures", []):
         line_name = _clean_line_name(rd.get("line", "---"))
         number    = rd.get("number", "")
+        if not line_name:
+            line_name = number if number else "---"
         direction = rd.get("destination", "---")
         platform  = _extract_platform(rd.get("bon", ""))
 
@@ -799,6 +801,9 @@ def _build_feed():
     else:
         for dep in departures:
             line       = _clean_line_name(dep.get("line", "---"))
+            line = re.sub(r'Nacht\w*', '', line).strip()
+            if not line:
+                line = dep.get("number", "") or "---"
             # Leerzeichen nach 'Bus' einfuegen falls fehlend (z.B. "Bus580" -> "Bus 580")
             if line.startswith("Bus") and len(line) > 3 and line[3].isdigit():
                 line = "Bus " + line[3:]
@@ -1208,7 +1213,7 @@ def _build_feed():
 # Hintergrund-Refresh: Feed alle 10 Minuten proaktiv aktualisieren
 # ---------------------------------------------------------------------------
 _feed_cache = {"xml": None, "ts": 0}
-_FEED_REFRESH_INTERVAL = 600  # 10 Minuten
+_FEED_REFRESH_INTERVAL = 120  # 2 Minuten
 
 
 def _refresh_feed_background():
