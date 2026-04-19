@@ -9,9 +9,10 @@ echo "[Start] Code aktualisiert. Starte Gunicorn..."
 
 exec gunicorn \
   --bind 0.0.0.0:5000 \
-  --workers 2 \
-  --timeout 60 \
-  --preload \
+  --workers 1 \
+  --worker-class gthread \
+  --threads 4 \
+  --timeout 120 \
   --max-requests 1000 \
   --max-requests-jitter 100 \
   rss_server:app
