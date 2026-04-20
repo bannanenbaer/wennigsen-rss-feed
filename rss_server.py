@@ -415,9 +415,19 @@ def _fetch_uestra():
 
 
 # ---------------------------------------------------------------------------
-# DB API
+# DB API (mit 5-Minuten-Cache um Timeouts zu vermeiden)
 # ---------------------------------------------------------------------------
+_db_cache = {"data": [], "trips_url": None, "ts": 0}
+_DB_CACHE_TTL = 300  # 5 Minuten
+
+
 def _fetch_db():
+    now_ts = time.time()
+    if _db_cache["data"] and (now_ts - _db_cache["ts"]) < _DB_CACHE_TTL:
+        log.info("DB: Nutze Cache (%d Abfahrten, Alter: %ds).",
+                 len(_db_cache["data"]), int(now_ts - _db_cache["ts"]))
+        return _db_cache["data"], _db_cache["trips_url"] or TRIPS_DB
+
     now = datetime.now(BERLIN_TZ)
     try:
         resp = http.get(
@@ -482,10 +492,16 @@ def _fetch_db():
             })
 
         log.info("DB: %d Abfahrten geladen.", len(results))
+        _db_cache["data"] = results
+        _db_cache["trips_url"] = TRIPS_DB
+        _db_cache["ts"] = time.time()
         return results, TRIPS_DB
 
     except Exception as e:
         log.error("DB fehlgeschlagen: %s", e)
+        if _db_cache["data"]:
+            log.info("DB: Nutze letzten Cache als Fallback (%d Abfahrten).", len(_db_cache["data"]))
+            return _db_cache["data"], _db_cache["trips_url"] or TRIPS_DB
         return [], TRIPS_DB
 
 
