@@ -58,8 +58,8 @@ def load_config(path="config.txt"):
                 _cfg["direction_left"] = line[2:].strip()
             elif line.startswith("> "):
                 _cfg["direction_right"] = line[2:].strip()
-            elif ": " in line:
-                key, _, value = line.partition(": ")
+            elif ":" in line:
+                key, _, value = line.partition(":")
                 key = key.strip()
                 value = value.strip()
                 if key == "local_provider":
@@ -75,10 +75,10 @@ def load_config(path="config.txt"):
 
 
 def resolve_stop_ids():
-    """Loese STOP_ID_DB per DB REST Locations-API auf. STOP_ID_NAHVERKEHR per EFA."""
+    """Loese STOP_ID_DB per DB REST Locations-API auf."""
     global STOP_ID_DB, API_DB, TRIPS_DB, STOP_NAME
     stop_name = _cfg.get("stop_name", STOP_NAME)
-    postal_code = _cfg.get("postal_code", "")
+    postal_code = str(_cfg.get("postal_code", "")).strip()
     STOP_NAME = stop_name
     try:
         resp = requests.get(
@@ -88,19 +88,25 @@ def resolve_stop_ids():
         )
         resp.raise_for_status()
         locations = resp.json()
+        if not isinstance(locations, list):
+            raise ValueError("Unerwartetes Antwortformat von DB Locations-API")
         candidates = locations
         if postal_code:
             filtered = [
                 loc for loc in locations
-                if postal_code in str((loc.get("address") or {}).get("postalCode", ""))
+                if postal_code in str((loc.get("address") or loc.get("location") or {}).get("postalCode") or "")
             ]
             if filtered:
                 candidates = filtered
         stop_cands = [c for c in candidates if c.get("type") in ("stop", "station")]
         best = stop_cands[0] if stop_cands else (candidates[0] if candidates else None)
         if best:
-            STOP_ID_DB = str(best.get("id", STOP_ID_DB))
-            log.info("[Config] STOP_ID_DB aufgeloest: %s (%s)", STOP_ID_DB, best.get("name", "?"))
+            found_id = best.get("id")
+            if found_id and str(found_id) != "None":
+                STOP_ID_DB = str(found_id)
+                log.info("[Config] STOP_ID_DB aufgeloest: %s (%s)", STOP_ID_DB, best.get("name", "?"))
+            else:
+                log.warning("[Config] Location ohne ID gefunden – behalte Default.")
         else:
             log.warning("[Config] Keine Location-Ergebnisse fuer '%s' – behalte Default.", stop_name)
     except Exception as exc:
@@ -347,6 +353,81 @@ def check_provider_availability():
         _provider_available["sbahn"] = False
         log.warning("[Startup] S-Bahn-Website nicht erreichbar: %s", exc)
     log.info("[Startup] Provider-Verfuegbarkeit: %s", _provider_available)
+
+
+# ---------------------------------------------------------------------------
+# Disk-Cache fuer aufgeloeste IDs und Discovery-Ergebnisse
+# ---------------------------------------------------------------------------
+_PROVIDER_CACHE_FILE = "provider_cache.json"
+
+
+def _load_provider_cache(path=_PROVIDER_CACHE_FILE):
+    """Lade aufgeloeste Provider-Config vom Disk-Cache. Gibt True zurueck, wenn erfolgreich."""
+    global STOP_ID_DB, STOP_ID_NAHVERKEHR, NAHVERKEHR_URL, _HAFAS_URL, API_DB, STOP_NAME
+    if not os.path.exists(path):
+        return False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        if data.get("stop_id_db"):
+            STOP_ID_DB = data["stop_id_db"]
+        if data.get("stop_name"):
+            STOP_NAME = data["stop_name"]
+        if data.get("stop_id_nahverkehr"):
+            STOP_ID_NAHVERKEHR = data["stop_id_nahverkehr"]
+        if data.get("nahverkehr_url"):
+            NAHVERKEHR_URL = data["nahverkehr_url"]
+        if data.get("hafas_url"):
+            _HAFAS_URL = data["hafas_url"]
+        if data.get("hafas_auth"):
+            _cfg["hafas_auth"] = data["hafas_auth"]
+        if data.get("providers_scraping"):
+            _cfg["providers_scraping"] = data["providers_scraping"]
+        API_DB = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+        cached_at = data.get("cached_at", "unbekannt")
+        log.info("[Cache] Geladen (%s): DB=%s, EFA=%s", cached_at[:16], STOP_ID_DB,
+                 NAHVERKEHR_URL[:50] if NAHVERKEHR_URL else "nein")
+        return True
+    except Exception as exc:
+        log.warning("[Cache] Konnte %s nicht laden: %s", path, exc)
+        return False
+
+
+def _save_provider_cache(path=_PROVIDER_CACHE_FILE):
+    """Speichere aktuell aufgeloeste Provider-Config auf Disk."""
+    try:
+        data = {
+            "stop_id_db": STOP_ID_DB,
+            "stop_name": STOP_NAME,
+            "stop_id_nahverkehr": STOP_ID_NAHVERKEHR,
+            "nahverkehr_url": NAHVERKEHR_URL,
+            "hafas_url": _HAFAS_URL,
+            "hafas_auth": _cfg.get("hafas_auth"),
+            "providers_scraping": _cfg.get("providers_scraping", []),
+            "cached_at": datetime.now(BERLIN_TZ).isoformat(),
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        log.info("[Cache] Gespeichert: %s", path)
+    except Exception as exc:
+        log.warning("[Cache] Konnte %s nicht speichern: %s", path, exc)
+
+
+def _discover_and_update():
+    """Vollstaendige Discovery im Hintergrund: IDs aufloesen, Endpunkte finden, Cache schreiben."""
+    log.info("[Discovery] Starte Hintergrund-Discovery...")
+    try:
+        resolve_stop_ids()
+        discover_providers(_cfg.get("local_providers", []))
+        _save_provider_cache()
+        check_provider_availability()
+        log.info("[Discovery] Hintergrund-Discovery abgeschlossen – baue Feed neu...")
+        xml_bytes = _build_feed()
+        _feed_cache["xml"] = xml_bytes
+        _feed_cache["ts"] = time.time()
+        log.info("[Discovery] Feed nach Discovery aktualisiert.")
+    except Exception as exc:
+        log.error("[Discovery] Hintergrund-Discovery fehlgeschlagen: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1593,11 +1674,17 @@ def _refresh_feed_background():
 
 
 # ---------------------------------------------------------------------------
-# Start-Sequenz: Config -> IDs -> Provider-Discovery -> Verfuegbarkeit -> Feed
+# Start-Sequenz: schneller Pfad (Cache) oder langsamer Pfad (Discovery im Hintergrund)
 # ---------------------------------------------------------------------------
 load_config("config.txt")
-resolve_stop_ids()
-discover_providers(_cfg.get("local_providers", []))
+STOP_NAME = _cfg.get("stop_name", STOP_NAME)
+
+_cache_hit = _load_provider_cache()
+if not _cache_hit:
+    # Erster Start oder kein Cache: nur DB-ID synchron aufloesen (~1s),
+    # volle Discovery (bis 60s) laeuft nicht-blockierend im Hintergrund.
+    resolve_stop_ids()
+
 check_provider_availability()
 
 log.info("[Startup] Lade Feed-Cache vor...")
@@ -1607,6 +1694,12 @@ try:
     log.info("[Startup] Feed-Cache erfolgreich vorgeladen.")
 except Exception as e:
     log.error("[Startup] Fehler beim Vorladen des Feed-Cache: %s", e)
+
+# Discovery immer im Hintergrund: aktualisiert Endpunkte und schreibt Cache.
+# Beim ersten Start (kein Cache): befuellt nahverkehr/HAFAS-Daten nach ~60s.
+# Bei Cache-Hit: refresht transparent ohne Startverzoegerung.
+_disc_thread = threading.Thread(target=_discover_and_update, daemon=True)
+_disc_thread.start()
 
 _refresh_thread = threading.Thread(target=_refresh_feed_background, daemon=True)
 _refresh_thread.start()
