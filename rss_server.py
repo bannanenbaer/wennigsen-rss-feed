@@ -11,6 +11,10 @@ import logging
 import pytz
 import urllib3
 from bs4 import BeautifulSoup
+import json
+import os
+import sys
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -25,12 +29,325 @@ log = logging.getLogger("rss_server")
 app = Flask(__name__)
 
 STOP_ID_DB     = "8006336"
-STOP_ID_UESTRA = "25005782"
+STOP_ID_NAHVERKEHR = "25005782"
 STOP_NAME      = "Wennigsen (Deister) Bahnhof"
 BERLIN_TZ      = pytz.timezone("Europe/Berlin")
 
 MAX_DEPARTURES      = 30
 MAX_STOPS           = 10
+
+# ---------------------------------------------------------------------------
+# Konfigurations-State (befuellt durch load_config() beim Start)
+# ---------------------------------------------------------------------------
+_cfg = {}
+_provider_available = {"nahverkehr": False, "db": False, "sbahn": False}
+
+
+def load_config(path="config.txt"):
+    """Lade config.txt und setze _cfg. Format: 'KEY: VALUE', '< ZIEL', '> ZIEL'."""
+    global _cfg
+    if not os.path.exists(path):
+        log.warning("[Config] Keine %s gefunden – verwende interne Defaults.", path)
+        return
+    with open(path, encoding="utf-8") as fh:
+        for raw_line in fh:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("< "):
+                _cfg["direction_left"] = line[2:].strip()
+            elif line.startswith("> "):
+                _cfg["direction_right"] = line[2:].strip()
+            elif ": " in line:
+                key, _, value = line.partition(": ")
+                key = key.strip()
+                value = value.strip()
+                if key == "local_provider":
+                    _cfg["local_providers"] = [d.strip() for d in value.split(";") if d.strip()]
+                else:
+                    _cfg[key] = value
+    if not _cfg.get("stop_name"):
+        log.error("[Config] 'stop_name' fehlt in %s.", path)
+        sys.exit(1)
+    log.info("[Config] Geladen: stop_name=%s, postal_code=%s, providers=%s",
+             _cfg.get("stop_name"), _cfg.get("postal_code", "(keine)"),
+             _cfg.get("local_providers", []))
+
+
+def resolve_stop_ids():
+    """Loese STOP_ID_DB per DB REST Locations-API auf. STOP_ID_NAHVERKEHR per EFA."""
+    global STOP_ID_DB, API_DB, TRIPS_DB, STOP_NAME
+    stop_name = _cfg.get("stop_name", STOP_NAME)
+    postal_code = _cfg.get("postal_code", "")
+    STOP_NAME = stop_name
+    try:
+        resp = requests.get(
+            "https://v6.db.transport.rest/locations",
+            params={"query": stop_name, "results": 20},
+            timeout=8,
+        )
+        resp.raise_for_status()
+        locations = resp.json()
+        candidates = locations
+        if postal_code:
+            filtered = [
+                loc for loc in locations
+                if postal_code in str((loc.get("address") or {}).get("postalCode", ""))
+            ]
+            if filtered:
+                candidates = filtered
+        stop_cands = [c for c in candidates if c.get("type") in ("stop", "station")]
+        best = stop_cands[0] if stop_cands else (candidates[0] if candidates else None)
+        if best:
+            STOP_ID_DB = str(best.get("id", STOP_ID_DB))
+            log.info("[Config] STOP_ID_DB aufgeloest: %s (%s)", STOP_ID_DB, best.get("name", "?"))
+        else:
+            log.warning("[Config] Keine Location-Ergebnisse fuer '%s' – behalte Default.", stop_name)
+    except Exception as exc:
+        log.warning("[Config] Location-Suche fehlgeschlagen: %s – behalte Default.", exc)
+    API_DB   = f"https://v6.db.transport.rest/stops/{STOP_ID_DB}/departures"
+    TRIPS_DB = "https://v6.db.transport.rest/trips"
+    log.info("[Config] Finale Stop-IDs: DB=%s, NAHVERKEHR=%s", STOP_ID_DB, STOP_ID_NAHVERKEHR)
+
+
+def _extract_stop_id_from_efa(data):
+    """Extrahiere Stop-ID aus EFA rapidJSON Antwort."""
+    for dep in data.get("departures", []):
+        stop_id = (dep.get("stop") or {}).get("id") or dep.get("stopId")
+        if stop_id:
+            return str(stop_id)
+    return None
+
+
+def _find_hafas_auth(soup, homepage_url):
+    """Suche nach HAFAS AID-Token in Seitenquelltext und verlinkten JS-Dateien."""
+    AID_RE = re.compile(r'"aid"\s*:\s*"([A-Za-z0-9]{10,40})"')
+    for script in soup.find_all("script"):
+        m = AID_RE.search(script.get_text())
+        if m:
+            return m.group(1)
+    base = urllib.parse.urlparse(homepage_url)
+    base_origin = f"{base.scheme}://{base.netloc}"
+    for tag in soup.find_all("script", src=True):
+        src = tag.get("src", "")
+        if src.startswith("//"):
+            src = base.scheme + ":" + src
+        elif src.startswith("/"):
+            src = base_origin + src
+        elif not src.startswith("http"):
+            continue
+        try:
+            r = requests.get(src, timeout=4, headers={"User-Agent": "Mozilla/5.0"})
+            if r.status_code == 200:
+                m = AID_RE.search(r.text)
+                if m:
+                    log.info("[Discovery] HAFAS Auth-Token in JS gefunden: %s", src)
+                    return m.group(1)
+        except Exception:
+            pass
+    return None
+
+
+def _discover_provider(domain):
+    """Crawle eine Provider-Domain und suche nach EFA-, HAFAS- und Scraping-Endpunkten."""
+    result = {
+        "efa_url": None, "efa_stop_id": None,
+        "hafas_url": None, "hafas_auth": None,
+        "scraping_url": None, "scraping_selector": None,
+    }
+    stop_name = _cfg.get("stop_name", STOP_NAME)
+    clean_domain = domain.lstrip("http://").lstrip("https://").lstrip("www.")
+
+    homepage_url = None
+    soup = None
+    all_links = set()
+    for try_url in [f"https://www.{clean_domain}", f"https://{clean_domain}"]:
+        try:
+            r = requests.get(try_url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"})
+            if r.status_code == 200:
+                homepage_url = try_url
+                soup = BeautifulSoup(r.text, "html.parser")
+                for a in soup.find_all("a", href=True):
+                    href = a.get("href", "")
+                    if href.startswith("http"):
+                        all_links.add(href)
+                break
+        except Exception as e:
+            log.debug("[Discovery] %s – Homepage-Fehler: %s", try_url, e)
+
+    if not soup:
+        log.warning("[Discovery] Domain %s nicht erreichbar.", domain)
+        return result
+
+    candidate_bases = set()
+    for link in all_links:
+        try:
+            p = urllib.parse.urlparse(link)
+            candidate_bases.add(f"{p.scheme}://{p.netloc}")
+        except Exception:
+            pass
+    for sub in ["abfahrten", "fahrplan", "auskunft", "efa", "api", "www", ""]:
+        prefix = f"{sub}." if sub else ""
+        candidate_bases.add(f"https://{prefix}{clean_domain}")
+
+    EFA_PATHS = [
+        "/proxy2/efa/XML_DM_REQUEST",
+        "/efa/XML_DM_REQUEST",
+        "/xml_departureboard/efa/XML_DM_REQUEST",
+    ]
+    for base in sorted(candidate_bases):
+        if result["efa_url"]:
+            break
+        for path in EFA_PATHS:
+            url = base + path
+            try:
+                r = requests.get(url, params={
+                    "type_dm": "any", "name_dm": stop_name,
+                    "outputFormat": "rapidJSON", "depSequence": 1, "mode": "direct",
+                }, timeout=5)
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        if "departures" in data or "stopEvents" in data:
+                            result["efa_url"] = url
+                            result["efa_stop_id"] = _extract_stop_id_from_efa(data)
+                            log.info("[Discovery] EFA gefunden: %s (Stop-ID: %s)",
+                                     url, result["efa_stop_id"])
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    HAFAS_PATHS = ["/hamm", "/hamm/"]
+    HAFAS_TEST = {
+        "ver": "1.56", "lang": "de",
+        "auth": {"type": "AID", "aid": "PLACEHOLDER"},
+        "client": {"id": "TEST", "type": "WEB"},
+        "formatted": False,
+        "svcReqL": [{"meth": "ServerInfo", "req": {}, "id": "1"}],
+    }
+    for base in sorted(candidate_bases):
+        if result["hafas_url"]:
+            break
+        for path in HAFAS_PATHS:
+            url = base + path
+            try:
+                r = requests.post(url, json=HAFAS_TEST, timeout=5,
+                                  headers={"Content-Type": "application/json"})
+                if r.status_code == 200:
+                    try:
+                        data = r.json()
+                        if "svcResL" in data or "err" in data:
+                            result["hafas_url"] = url
+                            result["hafas_auth"] = _find_hafas_auth(soup, homepage_url)
+                            log.info("[Discovery] HAFAS gefunden: %s (Auth: %s)", url,
+                                     "ja" if result["hafas_auth"] else "nicht gefunden")
+                            break
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    SCRAPE_SELECTORS = [
+        ("li", "main-announcements__text"),
+    ]
+    for tag, cls in SCRAPE_SELECTORS:
+        if soup.find_all(tag, class_=cls):
+            result["scraping_url"] = homepage_url
+            result["scraping_selector"] = f"{tag}.{cls}"
+            log.info("[Discovery] Scraping-Ziel gefunden: %s @ %s",
+                     result["scraping_selector"], homepage_url)
+            break
+    if not result["scraping_url"]:
+        for keyword in ["announcement", "meldung", "stoerung", "alert"]:
+            found = soup.find_all(
+                attrs={"class": lambda c, kw=keyword: bool(c and kw in " ".join(c).lower())}
+            )
+            if found:
+                result["scraping_url"] = homepage_url
+                result["scraping_selector"] = f"[class*='{keyword}']"
+                log.info("[Discovery] Scraping (allg.) gefunden: %s @ %s",
+                         result["scraping_selector"], homepage_url)
+                break
+
+    return result
+
+
+def discover_providers(domains):
+    """Analysiere alle konfigurierten Provider-Domains und befuelle _cfg."""
+    global STOP_ID_NAHVERKEHR, NAHVERKEHR_URL, _HAFAS_URL
+    _cfg.setdefault("providers_discovered", {})
+    _cfg.setdefault("providers_scraping", [])
+    efa_set = False
+    hafas_set = False
+    for domain in domains:
+        log.info("[Discovery] Analysiere: %s", domain)
+        result = _discover_provider(domain)
+        _cfg["providers_discovered"][domain] = result
+        if result["efa_url"] and not efa_set:
+            NAHVERKEHR_URL = result["efa_url"]
+            if result["efa_stop_id"]:
+                STOP_ID_NAHVERKEHR = result["efa_stop_id"]
+            efa_set = True
+            log.info("[Discovery] Nahverkehr EFA: %s, Stop-ID: %s",
+                     NAHVERKEHR_URL, STOP_ID_NAHVERKEHR)
+        if result["hafas_url"] and not hafas_set:
+            _HAFAS_URL = result["hafas_url"]
+            hafas_set = True
+            if result["hafas_auth"]:
+                _cfg["hafas_auth"] = result["hafas_auth"]
+        if result["scraping_url"]:
+            _cfg["providers_scraping"].append({
+                "domain": domain,
+                "url": result["scraping_url"],
+                "selector": result["scraping_selector"],
+            })
+    log.info("[Discovery] Ergebnis: EFA=%s, HAFAS=%s, Scraping=%d",
+             NAHVERKEHR_URL if efa_set else "nein",
+             _HAFAS_URL if hafas_set else "nein",
+             len(_cfg["providers_scraping"]))
+
+
+def _get_home_stop_ids():
+    """Alle bekannten Stop-IDs fuer den Heimatbahnhof (fuer Stopover-Filterung)."""
+    return {STOP_ID_DB, STOP_ID_NAHVERKEHR, "638806"}
+
+
+def check_provider_availability():
+    """Einmaliger Test-Request pro Provider beim Start. Setzt _provider_available."""
+    global _provider_available
+    # --- Nahverkehr (EFA) ---
+    if NAHVERKEHR_URL:
+        try:
+            live_params = dict(NAHVERKEHR_PARAMS)
+            live_params["name_dm"] = STOP_ID_NAHVERKEHR
+            live_params["depSequence"] = 1
+            r = requests.get(NAHVERKEHR_URL, params=live_params, timeout=5)
+            _provider_available["nahverkehr"] = (r.status_code == 200)
+        except Exception as exc:
+            _provider_available["nahverkehr"] = False
+            log.warning("[Startup] Nahverkehr EFA nicht erreichbar: %s", exc)
+    else:
+        _provider_available["nahverkehr"] = False
+    # --- DB ---
+    try:
+        r = requests.get(API_DB, params={"results": 1, "duration": 10}, timeout=6)
+        _provider_available["db"] = (r.status_code == 200)
+    except Exception as exc:
+        _provider_available["db"] = False
+        log.warning("[Startup] DB REST nicht erreichbar: %s", exc)
+    # --- S-Bahn (Scraping) ---
+    scrapers = _cfg.get("providers_scraping", [])
+    sbahn_url = scrapers[0].get("url", _SBAHN_URL) if scrapers else _SBAHN_URL
+    try:
+        r = requests.get(sbahn_url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"})
+        _provider_available["sbahn"] = (r.status_code == 200)
+    except Exception as exc:
+        _provider_available["sbahn"] = False
+        log.warning("[Startup] S-Bahn-Website nicht erreichbar: %s", exc)
+    log.info("[Startup] Provider-Verfuegbarkeit: %s", _provider_available)
+
 
 # ---------------------------------------------------------------------------
 # Stale-Cache fuer Zwischenhalte (Gedaechtnis bei DB-Ausfall)
@@ -46,17 +363,26 @@ _SBAHN_CACHE_TTL = 300  # 5 Minuten
 
 
 def _fetch_sbahn_announcements():
-    """Lauftext-Meldungen von sbahn-hannover.de scrapen."""
+    """Lauftext-Meldungen vom konfigurierten S-Bahn-Provider scrapen."""
+    if not _provider_available.get("sbahn", False):
+        return _sbahn_cache.get("stale", [])
     now_ts = datetime.now(BERLIN_TZ).timestamp()
     if _sbahn_cache["data"] and (now_ts - _sbahn_cache["ts"]) < _SBAHN_CACHE_TTL:
         return _sbahn_cache["data"]
+    scrapers = _cfg.get("providers_scraping", [])
+    sbahn_url = scrapers[0].get("url", _SBAHN_URL) if scrapers else _SBAHN_URL
+    selector_str = scrapers[0].get("selector", "li.main-announcements__text") if scrapers else "li.main-announcements__text"
     try:
-        resp = requests.get(_SBAHN_URL, timeout=8, headers={
+        resp = requests.get(sbahn_url, timeout=8, headers={
             "User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"
         })
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.find_all("li", class_="main-announcements__text")
+        if "." in selector_str:
+            tag_part, cls_part = selector_str.split(".", 1)
+            items = soup.find_all(tag_part or True, class_=cls_part)
+        else:
+            items = soup.select(selector_str)
         announcements = []
         for item in items:
             text = item.get_text(strip=True)
@@ -73,7 +399,7 @@ def _fetch_sbahn_announcements():
         return _sbahn_cache.get("stale", [])
 
 # ---------------------------------------------------------------------------
-# UESTRA / GVH HAFAS Linienmeldungen
+# Nahverkehr / GVH HAFAS Linienmeldungen
 # Reihenfolge: S-Bahn, sprinti, 300er/500er, Stadtbahn, 100er/200er/800er, Rest
 # ---------------------------------------------------------------------------
 _HAFAS_URL = "https://gvh.hafas.de/hamm"
@@ -103,8 +429,8 @@ _HAFAS_PRIORITY = {
     "100-170": 4, "200-254": 4, "800-870": 4,
     "400-492": 5, "600-699": 5, "700-799": 5,
 }
-_uestra_cache = {"data": [], "ts": 0, "stale": []}
-_UESTRA_CACHE_TTL = 300  # 5 Minuten
+_nahverkehr_cache = {"data": [], "ts": 0, "stale": []}
+_NAHVERKEHR_CACHE_TTL = 300  # 5 Minuten
 
 
 # Keywords fuer Fahrtstoerungen vs. Infrastruktur-Meldungen
@@ -135,13 +461,16 @@ def _categorize_message(title, text):
             return 1  # Infrastruktur
     return 0  # Default: Fahrstoerung
 
-def _fetch_uestra_line_messages():
+def _fetch_nahverkehr_messages():
     """Linienmeldungen von der GVH HAFAS API abrufen und nach Priorität sortieren."""
     import time as _time
     import re
+    if not _provider_available.get("nahverkehr", False):
+        return _nahverkehr_cache.get("stale", [])
     now_ts = datetime.now(BERLIN_TZ).timestamp()
-    if _uestra_cache["data"] and (now_ts - _uestra_cache["ts"]) < _UESTRA_CACHE_TTL:
-        return _uestra_cache["data"]
+    if _nahverkehr_cache["data"] and (now_ts - _nahverkehr_cache["ts"]) < _NAHVERKEHR_CACHE_TTL:
+        return _nahverkehr_cache["data"]
+    hafas_auth = _cfg.get("hafas_auth", "IKSEvZ1SsVdfIRSK")
     try:
         seen_titles = set()
         messages_with_priority = []
@@ -149,7 +478,7 @@ def _fetch_uestra_line_messages():
             payload = {
                 "ver": "1.62",
                 "lang": "deu",
-                "auth": {"type": "AID", "aid": "IKSEvZ1SsVdfIRSK"},
+                "auth": {"type": "AID", "aid": hafas_auth},
                 "client": {"id": "HAFAS", "type": "WEB", "name": "webapp",
                            "l": "vs_webapp", "v": 10109},
                 "formatted": False,
@@ -164,7 +493,7 @@ def _fetch_uestra_line_messages():
                 "hciVersion": "1.62",
                 "hciClientType": "WEB",
                 "hciClientVersion": "10109",
-                "aid": "IKSEvZ1SsVdfIRSK",
+                "aid": hafas_auth,
                 "rnd": str(int(_time.time() * 1000))
             }
             resp = requests.post(_HAFAS_URL, json=payload, params=params,
@@ -202,15 +531,15 @@ def _fetch_uestra_line_messages():
         # Sortiere nach Priorität (Liniengruppe), dann nach Kategorie (Fahrstoerung vor Infrastruktur)
         messages_with_priority.sort(key=lambda x: (x["priority"], x["category"]))
         messages = [{"title": m["title"], "text": m["text"], "category": m["category"]} for m in messages_with_priority]
-        _uestra_cache["data"] = messages
-        _uestra_cache["ts"] = now_ts
+        _nahverkehr_cache["data"] = messages
+        _nahverkehr_cache["ts"] = now_ts
         if messages:
-            _uestra_cache["stale"] = messages
-        log.info("UESTRA Meldungen geladen: %d Stueck", len(messages))
+            _nahverkehr_cache["stale"] = messages
+        log.info("Nahverkehr Meldungen geladen: %d Stueck", len(messages))
         return messages
     except Exception as e:
-        log.warning("UESTRA Meldungen Fehler: %s", e)
-        return _uestra_cache.get("stale", [])
+        log.warning("Nahverkehr Meldungen Fehler: %s", e)
+        return _nahverkehr_cache.get("stale", [])
 
 
 # Cache fuer trip_ids (Linie+Zeit+Richtung -> trip_id)
@@ -268,8 +597,8 @@ http = _build_session()
 # ---------------------------------------------------------------------------
 # API-URLs
 # ---------------------------------------------------------------------------
-UESTRA_URL = "https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST"
-UESTRA_PARAMS = {
+NAHVERKEHR_URL = "https://abfahrten.uestra.de/proxy2/efa/XML_DM_REQUEST"
+NAHVERKEHR_PARAMS = {
     "canChangeMOT": 0,
     "coordOutputFormat": "WGS84[dd.ddddd]",
     "deleteAssignedStops_dm": 1,
@@ -287,7 +616,7 @@ UESTRA_PARAMS = {
     "outputFormat": "rapidJSON",
     "useRealtime": 1,
     "type_dm": "any",
-    "name_dm": STOP_ID_UESTRA,
+    "name_dm": STOP_ID_NAHVERKEHR,
     "c": 1,
 }
 
@@ -338,17 +667,21 @@ def _clean_line_name(raw):
 
 
 # ---------------------------------------------------------------------------
-# UESTRA API
+# Nahverkehr EFA API
 # ---------------------------------------------------------------------------
-def _fetch_uestra():
+def _fetch_nahverkehr():
+    if not _provider_available.get("nahverkehr", False):
+        return []
+    live_params = dict(NAHVERKEHR_PARAMS)
+    live_params["name_dm"] = STOP_ID_NAHVERKEHR
     try:
-        resp = http.get(UESTRA_URL, params=UESTRA_PARAMS, timeout=5)
+        resp = http.get(NAHVERKEHR_URL, params=live_params, timeout=5)
         if resp.status_code != 200:
-            log.warning("UESTRA Status %s", resp.status_code)
+            log.warning("Nahverkehr EFA Status %s", resp.status_code)
             return []
         data = resp.json()
     except Exception as e:
-        log.error("UESTRA fehlgeschlagen: %s", e)
+        log.error("Nahverkehr EFA fehlgeschlagen: %s", e)
         return []
 
     now = datetime.now(BERLIN_TZ)
@@ -406,11 +739,11 @@ def _fetch_uestra():
                 "cancelled":  False,
                 "remarks":    disruptions[:],
                 "hints":      hints_text[:],
-                "source":     "uestra",
+                "source":     "nahverkehr",
                 "trip_id":    None,
             })
 
-    log.info("UESTRA: %d Abfahrten geladen.", len(results))
+    log.info("Nahverkehr EFA: %d Abfahrten geladen.", len(results))
     return results
 
 
@@ -422,6 +755,10 @@ _DB_CACHE_TTL = 300  # 5 Minuten
 
 
 def _fetch_db():
+    if not _provider_available.get("db", False):
+        if _db_cache["data"]:
+            return _db_cache["data"], _db_cache.get("trips_url") or TRIPS_DB
+        return [], TRIPS_DB
     now_ts = time.time()
     if _db_cache["data"] and (now_ts - _db_cache["ts"]) < _DB_CACHE_TTL:
         log.info("DB: Nutze Cache (%d Abfahrten, Alter: %ds).",
@@ -551,8 +888,8 @@ def _fetch_stopovers(trip_id, trips_url):
         for s in raw:
             sid        = str(s.get("stop", {}).get("id", ""))
             station_id = str(s.get("stop", {}).get("station", {}).get("id", ""))
-            # Wennigsen IDs: 8006336, 638806, 25005782
-            if sid in (STOP_ID_DB, "638806", "25005782") or station_id in (STOP_ID_DB, "638806", "25005782"):
+            _home_ids = _get_home_stop_ids()
+            if sid in _home_ids or station_id in _home_ids:
                 found = True
                 continue
             if found:
@@ -590,10 +927,10 @@ def _fetch_stopovers(trip_id, trips_url):
 # Hauptlogik: Abfahrten zusammenfuehren
 # ---------------------------------------------------------------------------
 def _get_departures():
-    uestra_deps        = _fetch_uestra()
+    nahverkehr_deps        = _fetch_nahverkehr()
     db_deps, trips_url = _fetch_db()
 
-    if uestra_deps:
+    if nahverkehr_deps:
         # Primaeres Lookup: Linie + Richtung (normalisiert) + Zeit
         db_lookup = {}
         # Sekundaeres Lookup: nur Linie + Zeit (fuer unterschiedliche Richtungsnamen)
@@ -609,7 +946,7 @@ def _get_departures():
                 db_lookup_no_dir.setdefault(lt_key, d)
 
         enriched = []
-        for dep in uestra_deps:
+        for dep in nahverkehr_deps:
             if not dep["planned_dt"]:
                 enriched.append(dep)
                 continue
@@ -689,7 +1026,7 @@ def _get_departures():
                     unique_enriched.append(d)
 
         final       = unique_enriched
-        source_info = "UESTRA + DB"
+        source_info = "Nahverkehr + DB"
     elif db_deps:
         final       = db_deps
         source_info = "DB (Fallback)"
@@ -733,9 +1070,9 @@ def _build_feed():
     lines.append('<?xml version="1.0" encoding="ISO-8859-1"?>')
     lines.append('<rss version="2.0">')
     lines.append('<channel>')
-    lines.append('<title>Abfahrten Wennigsen</title>')
+    lines.append(f'<title>Abfahrten {_sanitize(STOP_NAME)}</title>')
     lines.append('<link>https://www.gvh.de</link>')
-    lines.append('<description>Naechste Abfahrten am Wennigsen (Deister) Bahnhof</description>')
+    lines.append(f'<description>Naechste Abfahrten am {_sanitize(STOP_NAME)}</description>')
     lines.append('<language>de-de</language>')
     lines.append('<ttl>1</ttl>')
     lines.append(f'<lastBuildDate>{now_str}</lastBuildDate>')
@@ -874,20 +1211,29 @@ def _build_feed():
                     if len(stops) > MAX_STOPS:
                         stopover_lines.append("... weitere Halte")
 
-            # Pfeil-Logik basierend auf naechstem Halt
+            # Pfeil-Logik basierend auf naechstem Halt und Config-Richtungszielen
             if is_train:
-                if "lemmie" in next_stop_name:
+                _cfg_right = _cfg.get("direction_right", "hannover").lower()
+                _cfg_left  = _cfg.get("direction_left",  "barsinghausen").lower()
+                _next3 = [s[1].lower() for s in (stops[:3] if trip_id and trips_url else [])]
+                if any(_cfg_right in s or s in _cfg_right for s in _next3):
+                    arrow = _ARROW_RIGHT
+                elif any(_cfg_left in s or s in _cfg_left for s in _next3):
+                    arrow = _ARROW_LEFT
+                elif "lemmie" in next_stop_name:
                     arrow = _ARROW_RIGHT
                 elif "egestorf" in next_stop_name:
                     arrow = _ARROW_LEFT
                 else:
-                    # Fallback auf alte Logik falls naechster Halt unbekannt
+                    # Fallback auf Richtungs-Config falls naechster Halt unbekannt
                     dir_lower = direction.lower()
-                    hannover_stations = ["hannover", "hbf", "hauptbahnhof", "seelze", "nienburg", "minden", "wunstorf", "celle"]
-                    haste_stations = ["haste", "egestorf", "barsinghausen"]
-                    if any(st in dir_lower for st in hannover_stations):
+                    dir_right_kw = _cfg.get("direction_right", "hannover").lower()
+                    dir_left_kw  = _cfg.get("direction_left",  "barsinghausen").lower()
+                    _right_stations = ["hannover", "hbf", "hauptbahnhof", "seelze", "nienburg", "minden", "wunstorf", "celle", dir_right_kw]
+                    _left_stations  = ["haste", "egestorf", "barsinghausen", dir_left_kw]
+                    if any(st in dir_lower for st in _right_stations):
                         arrow = _ARROW_RIGHT
-                    elif any(st in dir_lower for st in haste_stations):
+                    elif any(st in dir_lower for st in _left_stations):
                         arrow = _ARROW_LEFT
                     else:
                         arrow = "-"
@@ -1163,13 +1509,13 @@ def _build_feed():
                 lines.append(f'<!-- trip_id: {trip_id} -->')
             lines.append('</item>')
 
-    # --- UESTRA / GVH Linienmeldungen als LETZTES Item ---
-    uestra_messages = _fetch_uestra_line_messages()
-    if uestra_messages:
+    # --- Nahverkehr / GVH Linienmeldungen als LETZTES Item ---
+    nahverkehr_messages = _fetch_nahverkehr_messages()
+    if nahverkehr_messages:
         lines.append('<item>')
         # Trenne Fahrstoerungen (category=0) und Infrastruktur (category=1)
-        fahrstoerungen = [m for m in uestra_messages if m.get("category", 0) == 0]
-        infrastruktur = [m for m in uestra_messages if m.get("category", 0) == 1]
+        fahrstoerungen = [m for m in nahverkehr_messages if m.get("category", 0) == 0]
+        infrastruktur = [m for m in nahverkehr_messages if m.get("category", 0) == 1]
         n_msg = len(fahrstoerungen) + len(infrastruktur)
         if n_msg == 1:
             lines.append('<title>--- Aktuelle Meldung ---</title>')
@@ -1246,7 +1592,14 @@ def _refresh_feed_background():
             log.error("[Hintergrund] Fehler beim Aktualisieren des Feeds: %s", e)
 
 
-# Cache beim Start synchron vorladen, damit sofortige Anfragen nicht blockieren
+# ---------------------------------------------------------------------------
+# Start-Sequenz: Config -> IDs -> Provider-Discovery -> Verfuegbarkeit -> Feed
+# ---------------------------------------------------------------------------
+load_config("config.txt")
+resolve_stop_ids()
+discover_providers(_cfg.get("local_providers", []))
+check_provider_availability()
+
 log.info("[Startup] Lade Feed-Cache vor...")
 try:
     _feed_cache["xml"] = _build_feed()
@@ -1255,7 +1608,6 @@ try:
 except Exception as e:
     log.error("[Startup] Fehler beim Vorladen des Feed-Cache: %s", e)
 
-# Hintergrund-Thread schlaeft erst, dann aktualisiert er alle 10 Minuten
 _refresh_thread = threading.Thread(target=_refresh_feed_background, daemon=True)
 _refresh_thread.start()
 
@@ -1264,10 +1616,11 @@ _refresh_thread.start()
 # ---------------------------------------------------------------------------
 @app.route("/")
 def index():
+    stop = _sanitize(STOP_NAME)
     return (
-        "<h1>RSS-Feed Wennigsen (Deister) Bahnhof</h1>"
+        f"<h1>RSS-Feed {stop}</h1>"
         "<p><a href='/feed.rss'>Zum RSS-Feed</a></p>"
-        "<p>Datenquellen: UESTRA (Echtzeit) + Deutsche Bahn "
+        "<p>Datenquellen: Nahverkehr EFA (Echtzeit) + Deutsche Bahn "
         "(Zwischenhalte &amp; Stoerungen)</p>"
         "<p>Optimiert fuer Fritz!Fon (ISO-8859-1)</p>"
     )
@@ -1282,12 +1635,13 @@ def rss_feed():
     else:
         # Sollte nach synchronem Startup-Vorladen nicht vorkommen - Platzhalter zurueckgeben
         log.warning("Feed-Cache leer - sende Platzhalter")
+        _stop = _sanitize(STOP_NAME)
         placeholder = (
             '<?xml version="1.0" encoding="iso-8859-1"?>'
             '<rss version="2.0"><channel>'
-            '<title>Wennigsen (Deister) Bahnhof</title>'
+            f'<title>{_stop}</title>'
             '<link>https://abfahrten-wennigsen-bhf.onrender.com</link>'
-            '<description>Abfahrten Wennigsen (Deister)</description>'
+            f'<description>Abfahrten {_stop}</description>'
             '<item><title>Daten werden geladen...</title>'
             '<description><![CDATA[Bitte in Kuerze erneut versuchen.]]></description></item>'
             '</channel></rss>'

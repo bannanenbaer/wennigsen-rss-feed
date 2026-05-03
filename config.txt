@@ -1,0 +1,5 @@
+stop_name: Wennigsen (Deister) Bahnhof
+postal_code: 30974
+local_provider: uestra.de; sbahn-hannover.de
+< Barsinghausen
+> Hannover
