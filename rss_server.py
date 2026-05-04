@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import urllib.parse
+import concurrent.futures
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -162,7 +163,8 @@ def _discover_provider(domain):
         "scraping_url": None, "scraping_selector": None,
     }
     stop_name = _cfg.get("stop_name", STOP_NAME)
-    clean_domain = domain.lstrip("http://").lstrip("https://").lstrip("www.")
+    clean_domain = re.sub(r'^https?://', '', domain)
+    clean_domain = re.sub(r'^www\.', '', clean_domain)
 
     homepage_url = None
     soup = None
@@ -283,8 +285,8 @@ def _discover_provider(domain):
 def discover_providers(domains):
     """Analysiere alle konfigurierten Provider-Domains und befuelle _cfg."""
     global STOP_ID_NAHVERKEHR, NAHVERKEHR_URL, _HAFAS_URL
-    _cfg.setdefault("providers_discovered", {})
-    _cfg.setdefault("providers_scraping", [])
+    _cfg["providers_discovered"] = {}
+    _cfg["providers_scraping"] = []
     efa_set = False
     hafas_set = False
     for domain in domains:
@@ -321,37 +323,48 @@ def _get_home_stop_ids():
 
 
 def check_provider_availability():
-    """Einmaliger Test-Request pro Provider beim Start. Setzt _provider_available."""
+    """Test-Request pro Provider. Die drei Checks laufen parallel."""
     global _provider_available
-    # --- Nahverkehr (EFA) ---
-    if NAHVERKEHR_URL:
+
+    def _check_nahverkehr():
+        if not NAHVERKEHR_URL:
+            return False
         try:
             live_params = dict(NAHVERKEHR_PARAMS)
             live_params["name_dm"] = STOP_ID_NAHVERKEHR
             live_params["depSequence"] = 1
             r = requests.get(NAHVERKEHR_URL, params=live_params, timeout=5)
-            _provider_available["nahverkehr"] = (r.status_code == 200)
+            return r.status_code == 200
         except Exception as exc:
-            _provider_available["nahverkehr"] = False
             log.warning("[Startup] Nahverkehr EFA nicht erreichbar: %s", exc)
-    else:
-        _provider_available["nahverkehr"] = False
-    # --- DB ---
-    try:
-        r = requests.get(API_DB, params={"results": 1, "duration": 10}, timeout=6)
-        _provider_available["db"] = (r.status_code == 200)
-    except Exception as exc:
-        _provider_available["db"] = False
-        log.warning("[Startup] DB REST nicht erreichbar: %s", exc)
-    # --- S-Bahn (Scraping) ---
-    scrapers = _cfg.get("providers_scraping", [])
-    sbahn_url = scrapers[0].get("url", _SBAHN_URL) if scrapers else _SBAHN_URL
-    try:
-        r = requests.get(sbahn_url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"})
-        _provider_available["sbahn"] = (r.status_code == 200)
-    except Exception as exc:
-        _provider_available["sbahn"] = False
-        log.warning("[Startup] S-Bahn-Website nicht erreichbar: %s", exc)
+            return False
+
+    def _check_db():
+        try:
+            r = requests.get(API_DB, params={"results": 1, "duration": 10}, timeout=6)
+            return r.status_code == 200
+        except Exception as exc:
+            log.warning("[Startup] DB REST nicht erreichbar: %s", exc)
+            return False
+
+    def _check_sbahn():
+        scrapers = _cfg.get("providers_scraping", [])
+        sbahn_url = scrapers[0].get("url", _SBAHN_URL) if scrapers else _SBAHN_URL
+        try:
+            r = requests.get(sbahn_url, timeout=8,
+                             headers={"User-Agent": "Mozilla/5.0 (RSS-Feed-Bot)"})
+            return r.status_code == 200
+        except Exception as exc:
+            log.warning("[Startup] S-Bahn-Website nicht erreichbar: %s", exc)
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+        f_nv = ex.submit(_check_nahverkehr)
+        f_db = ex.submit(_check_db)
+        f_sb = ex.submit(_check_sbahn)
+        _provider_available["nahverkehr"] = f_nv.result()
+        _provider_available["db"]         = f_db.result()
+        _provider_available["sbahn"]      = f_sb.result()
     log.info("[Startup] Provider-Verfuegbarkeit: %s", _provider_available)
 
 
@@ -544,8 +557,6 @@ def _categorize_message(title, text):
 
 def _fetch_nahverkehr_messages():
     """Linienmeldungen von der GVH HAFAS API abrufen und nach Priorität sortieren."""
-    import time as _time
-    import re
     if not _provider_available.get("nahverkehr", False):
         return _nahverkehr_cache.get("stale", [])
     now_ts = datetime.now(BERLIN_TZ).timestamp()
@@ -575,7 +586,7 @@ def _fetch_nahverkehr_messages():
                 "hciClientType": "WEB",
                 "hciClientVersion": "10109",
                 "aid": hafas_auth,
-                "rnd": str(int(_time.time() * 1000))
+                "rnd": str(int(time.time() * 1000))
             }
             resp = requests.post(_HAFAS_URL, json=payload, params=params,
                                  timeout=8, headers={
