@@ -2,6 +2,7 @@
 set -e
 
 echo "[Start] Neuesten Code von GitHub holen..."
+rm -rf /tmp/repo
 git clone --depth=1 https://github.com/bannanenbaer/wennigsen-rss-feed.git /tmp/repo
 cp /tmp/repo/rss_server.py /app/rss_server.py
 rm -rf /tmp/repo
