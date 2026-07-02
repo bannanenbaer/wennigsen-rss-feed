@@ -38,15 +38,18 @@ MAX_STOPS           = 10
 _stopovers_memory = {}
 
 # ---------------------------------------------------------------------------
-# S-Bahn Hannover Stoerungsmeldungen (Lauftext-Scraping)
+# S-Bahn Hannover Stoerungsmeldungen ("Aktuelle Meldungen" von sbahn-hannover.de,
+# gefiltert auf S1/S2/S21 -- das Laufband oben auf der Seite wird clientseitig
+# nachgeladen und steckt nicht mehr im HTML, die Meldungs-Kacheln darunter schon)
 # ---------------------------------------------------------------------------
 _SBAHN_URL = "https://www.sbahn-hannover.de/"
 _sbahn_cache = {"data": [], "ts": 0, "stale": []}
 _SBAHN_CACHE_TTL = 300  # 5 Minuten
+_SBAHN_LINE_PATTERN = re.compile(r"\bS\s?(?:1|2|21)\b", re.IGNORECASE)
 
 
 def _fetch_sbahn_announcements():
-    """Lauftext-Meldungen von sbahn-hannover.de scrapen."""
+    """Meldungen von sbahn-hannover.de scrapen, gefiltert auf Linien S1/S2/S21."""
     now_ts = datetime.now(BERLIN_TZ).timestamp()
     if _sbahn_cache["data"] and (now_ts - _sbahn_cache["ts"]) < _SBAHN_CACHE_TTL:
         return _sbahn_cache["data"]
@@ -56,17 +59,21 @@ def _fetch_sbahn_announcements():
         })
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
-        items = soup.find_all("li", class_="main-announcements__text")
         announcements = []
-        for item in items:
-            text = item.get_text(strip=True)
-            if text:
-                announcements.append(text)
+        for article in soup.find_all("article"):
+            heading = article.find(["h1", "h2", "h3"])
+            title = heading.get_text(strip=True) if heading else ""
+            teaser_el = article.find("p")
+            teaser = teaser_el.get_text(strip=True) if teaser_el else ""
+            if not title or not _SBAHN_LINE_PATTERN.search(f"{title} {teaser}"):
+                continue
+            text = f"{title}: {teaser}" if teaser and teaser != title else title
+            announcements.append(text)
         _sbahn_cache["data"] = announcements
         _sbahn_cache["ts"] = now_ts
         if announcements:
             _sbahn_cache["stale"] = announcements
-        log.info("S-Bahn Meldungen geladen: %d Stueck", len(announcements))
+        log.info("S-Bahn Meldungen geladen (S1/S2): %d Stueck", len(announcements))
         return announcements
     except Exception as e:
         log.warning("S-Bahn Meldungen Fehler: %s", e)
